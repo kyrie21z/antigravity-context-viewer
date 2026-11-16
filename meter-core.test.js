@@ -3578,3 +3578,219 @@ test('Gemini 4 Hydrogen 四档模型识别、1M 统一单档计价、配额池�
     fs.rmSync(cliDir, { recursive: true, force: true });
   }
 });
+
+test('WSL CLI discovery: parses Lxss registry & wsl -l UTF-16LE, filters container distros, and respects isolation', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const {
+    parseWslLxssRegistryOutput,
+    parseWslListOutput,
+    findWslAntigravityCliDirs
+  } = require('./meter-collector');
+
+  const regSample = [
+    'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss',
+    '    DefaultDistribution    REG_SZ    {22222222-2222-2222-2222-222222222222}',
+    '',
+    'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{11111111-1111-1111-1111-111111111111}',
+    '    DistributionName    REG_SZ    docker-desktop',
+    '    Version    REG_DWORD    0x2',
+    '',
+    'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{22222222-2222-2222-2222-222222222222}',
+    '    DistributionName    REG_SZ    Ubuntu-26.04',
+    '    Version    REG_DWORD    0x2',
+    '    BasePath    REG_SZ    D:\\WSL\\Ubuntu-26.04',
+    '',
+    'HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{33333333-3333-3333-3333-333333333333}',
+    '    DistributionName    REG_SZ    Debian',
+    '    Version    REG_DWORD    0x2'
+  ].join('\r\n');
+
+  const parsedReg = parseWslLxssRegistryOutput(regSample);
+  assert.deepEqual(parsedReg.map(d => d.distro), ['Ubuntu-26.04', 'Debian']);
+  assert.equal(parsedReg[0].isDefault, true);
+
+  const wslBuf = Buffer.from('\uFEFF  docker-desktop-data\r\n* Ubuntu-26.04\r\n  Alpine\r\n', 'utf16le');
+  const parsedList = parseWslListOutput(wslBuf);
+  assert.deepEqual(parsedList.map(d => d.distro), ['Ubuntu-26.04', 'Alpine']);
+
+  // Mock root tree discovery
+  const mockRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-wsl-root-'));
+  try {
+    const wslCliPath = path.join(mockRoot, 'home', 'alice', '.gemini', 'antigravity-cli');
+    fs.mkdirSync(wslCliPath, { recursive: true });
+
+    const found = findWslAntigravityCliDirs({
+      _forceWin32: true,
+      _skipDiscoveryCache: true,
+      autoDiscoverWsl: true,
+      _regOutput: regSample,
+      _wslRootCandidatesForDistro: (distro) => distro === 'Ubuntu-26.04' ? [mockRoot] : []
+    });
+    assert.equal(found.supported, true);
+    assert.equal(found.enabled, true);
+    assert.equal(found.dirs.length, 1);
+    assert.equal(found.dirs[0].distro, 'Ubuntu-26.04');
+    assert.equal(found.dirs[0].user, 'alice');
+    assert.equal(found.dirs[0].path, wslCliPath);
+
+    // Disabled by preference
+    const disabled = findWslAntigravityCliDirs({
+      _forceWin32: true,
+      _skipDiscoveryCache: true,
+      autoDiscoverWsl: true,
+      customSettings: { uiPreferences: { includeWslCli: false } }
+    });
+    assert.equal(disabled.supported, true);
+    assert.equal(disabled.enabled, false);
+    assert.deepEqual(disabled.dirs, []);
+  } finally {
+    fs.rmSync(mockRoot, { recursive: true, force: true });
+  }
+});
+
+test('WSL CLI integration: aggregates WSL CLI tokens with desktop & local CLI, persists disk cache, and toggles cleanly without double-counting', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const {
+    savePluginSettings,
+    getPluginSettings,
+    sumDailyMapTokens
+  } = require('./meter-collector');
+  const { normalizeTokenHistoryPayload } = require('./meter-core');
+
+  const agDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-wsl-int-ag-'));
+  const localCliDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-wsl-int-local-'));
+  const wslDistroRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-wsl-int-distro-'));
+  const wslCliDir = path.join(wslDistroRoot, 'home', 'devuser', '.gemini', 'antigravity-cli');
+
+  try {
+    fs.mkdirSync(path.join(agDir, 'brain', 'desk-1', '.system_generated', 'logs'), { recursive: true });
+    fs.mkdirSync(path.join(agDir, 'conversations'), { recursive: true });
+    fs.mkdirSync(path.join(localCliDir, 'brain', 'loc-1', '.system_generated', 'logs'), { recursive: true });
+    fs.mkdirSync(path.join(localCliDir, 'conversations'), { recursive: true });
+    fs.mkdirSync(path.join(wslCliDir, 'brain', 'wsl-1', '.system_generated', 'logs'), { recursive: true });
+    fs.mkdirSync(path.join(wslCliDir, 'conversations'), { recursive: true });
+
+    fs.writeFileSync(path.join(wslCliDir, 'conversations', 'wsl-1.db'), 'db-fixture', 'utf8');
+    fs.writeFileSync(path.join(wslCliDir, 'conversations', 'wsl-2.db'), 'db-fixture', 'utf8');
+
+    const desktopEv = {
+      step_index: 1,
+      created_at: '2026-11-15T10:00:00Z',
+      model: 'gemini-4-hydrogen-medium',
+      input_tokens: 1000,
+      cache_read_tokens: 500,
+      output_tokens: 100
+    };
+    const localCliEv = {
+      step_index: 1,
+      created_at: '2026-11-15T11:00:00Z',
+      model: 'gemini-4-hydrogen-medium',
+      input_tokens: 2000,
+      cache_read_tokens: 1000,
+      output_tokens: 200
+    };
+    const wslCliEv1 = {
+      step_index: 2,
+      created_at: '2026-11-15T12:00:00Z',
+      model: 'gemini-4-hydrogen-medium',
+      input_tokens: 10000,
+      cache_read_tokens: 20000,
+      output_tokens: 500
+    };
+    const wslCliEv2 = {
+      step_index: 3,
+      created_at: '2026-11-15T12:05:00Z',
+      model: '',
+      input_tokens: 3000,
+      cache_read_tokens: 0,
+      output_tokens: 100
+    };
+
+    fs.writeFileSync(
+      path.join(agDir, 'brain', 'desk-1', '.system_generated', 'logs', 'transcript.jsonl'),
+      JSON.stringify(desktopEv) + '\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(localCliDir, 'brain', 'loc-1', '.system_generated', 'logs', 'transcript.jsonl'),
+      JSON.stringify(localCliEv) + '\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(wslCliDir, 'brain', 'wsl-1', '.system_generated', 'logs', 'transcript.jsonl'),
+      [JSON.stringify(wslCliEv1), JSON.stringify(wslCliEv2)].join('\n') + '\n',
+      'utf8'
+    );
+
+    const runScan = (extra = {}) => collectTokenHistoryAsync({
+      force: true,
+      agDir,
+      agCliDir: localCliDir,
+      wslCliDirs: [wslCliDir],
+      useWorker: false,
+      useTranscriptDiskCache: true,
+      userStatus: { userTier: { name: 'Pro' }, planStatus: { availablePromptCredits: 500 } },
+      ...extra
+    });
+
+    // 1. Initial scan with WSL ON
+    const res1 = await runScan();
+    assert.equal(res1.sources.desktop.transcriptsCount, 1);
+    assert.equal(res1.sources.cli.localTranscriptsCount, 1);
+    assert.equal(res1.sources.cli.wslTranscriptsCount, 1);
+    assert.equal(res1.sources.cli.wslConversationsCount, 2);
+    assert.equal(res1.sources.cli.transcriptsCount, 2);
+    assert.equal(res1.sources.cli.wslEnabled, true);
+    assert.equal(res1.sources.cli.wslDirs.length, 1);
+    assert.equal(res1.sources.cli.wslDirs[0].tokens, 33600);
+    assert.equal(sumDailyMapTokens(res1.dailyMapBySource.desktop), 1600);
+    assert.equal(sumDailyMapTokens(res1.dailyMapBySource.cliLocal), 3200);
+    assert.equal(sumDailyMapTokens(res1.dailyMapBySource.cliWsl), 33600);
+    assert.equal(sumDailyMapTokens(res1.dailyMapBySource.cli), 36800);
+    assert.equal(res1.summary.grandTotalTokens, 38400);
+    assert.equal(res1.costEstimateBySource.cli.pricedRequestsCount, 2); // localCliEv + wslCliEv1
+    assert.equal(res1.costEstimateBySource.cli.unpricedRequestsCount, 1); // wslCliEv2
+    assert.equal(fs.existsSync(path.join(agDir, 'transcript_scan_cache_v1.json')), true);
+
+    // Per-source normalization checks
+    const normCli = normalizeTokenHistoryPayload(res1, { source: 'cli', todayStr: '2026-11-15' });
+    assert.equal(normCli.summary.grandTotalTokens, 36800);
+    assert.equal(normCli.summary.totalConversations, 2);
+    assert.ok(normCli.referenceCost.all.totalCostUSD > 0);
+
+    // 2. Toggle WSL OFF via savePluginSettings
+    const saveOff = savePluginSettings({ includeWslCli: false }, { targetDir: agDir });
+    assert.equal(saveOff.ok, true);
+    assert.equal(getPluginSettings({ agDir }).uiPreferences.includeWslCli, false);
+
+    const resOff = await runScan();
+    assert.equal(resOff.sources.cli.wslEnabled, false);
+    assert.equal(sumDailyMapTokens(resOff.dailyMapBySource.cliWsl), 0);
+    assert.equal(sumDailyMapTokens(resOff.dailyMapBySource.cli), 3200);
+    assert.equal(resOff.summary.grandTotalTokens, 4800);
+    assert.equal(resOff.costEstimateBySource.cli.pricedRequestsCount, 1);
+    assert.equal(resOff.costEstimateBySource.cli.unpricedRequestsCount, 0);
+
+    // 3. Simulate an older host overwriting v2 without split fields, then re-enable WSL -> must NOT double count
+    const v2Path = path.join(agDir, 'token_usage_archive_v2.json');
+    const v2Raw = JSON.parse(fs.readFileSync(v2Path, 'utf8'));
+    delete v2Raw.dailyMapBySource.cliLocal;
+    delete v2Raw.dailyMapBySource.cliWsl;
+    fs.writeFileSync(v2Path, JSON.stringify(v2Raw), 'utf8');
+
+    savePluginSettings({ uiPreferences: { includeWslCli: true } }, { targetDir: agDir });
+    const resReOn = await runScan();
+    assert.equal(resReOn.sources.cli.wslEnabled, true);
+    assert.equal(sumDailyMapTokens(resReOn.dailyMapBySource.cli), 36800);
+    assert.equal(resReOn.summary.grandTotalTokens, 38400);
+    assert.equal(resReOn.costEstimateBySource.cli.pricedRequestsCount, 2);
+  } finally {
+    fs.rmSync(agDir, { recursive: true, force: true });
+    fs.rmSync(localCliDir, { recursive: true, force: true });
+    fs.rmSync(wslDistroRoot, { recursive: true, force: true });
+  }
+});

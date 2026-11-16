@@ -2440,24 +2440,31 @@
 
     const refMonth = payload.referenceCost?.currentMonth;
     const refAll = payload.referenceCost?.all;
-    if (refMonth) {
-      if (refMonth.inputTokens && !currentMonthInput) currentMonthInput = Number(refMonth.inputTokens);
-      if (refMonth.cacheTokens && !currentMonthCache) currentMonthCache = Number(refMonth.cacheTokens);
-      if (refMonth.outputTokens && !currentMonthOutput) currentMonthOutput = Number(refMonth.outputTokens);
-      if (refMonth.totalTokens && !monthTokens) monthTokens = Number(refMonth.totalTokens);
-      else if (!monthTokens && (currentMonthInput || currentMonthOutput || currentMonthCache)) {
-        monthTokens = currentMonthInput + currentMonthOutput + currentMonthCache;
+    if (source === 'all') {
+      if (refMonth) {
+        if (refMonth.inputTokens && !currentMonthInput) currentMonthInput = Number(refMonth.inputTokens);
+        if (refMonth.cacheTokens && !currentMonthCache) currentMonthCache = Number(refMonth.cacheTokens);
+        if (refMonth.outputTokens && !currentMonthOutput) currentMonthOutput = Number(refMonth.outputTokens);
+        if (refMonth.totalTokens && !monthTokens) monthTokens = Number(refMonth.totalTokens);
+        else if (!monthTokens && (currentMonthInput || currentMonthOutput || currentMonthCache)) {
+          monthTokens = currentMonthInput + currentMonthOutput + currentMonthCache;
+        }
+      }
+      if (refAll) {
+        if (refAll.inputTokens && !totalInputTokens) totalInputTokens = Number(refAll.inputTokens);
+        if (refAll.cacheTokens && !totalCacheTokens) totalCacheTokens = Number(refAll.cacheTokens);
+        if (refAll.outputTokens && !totalOutputTokens) totalOutputTokens = Number(refAll.outputTokens);
+        if (refAll.totalTokens && !grandTotalTokens) grandTotalTokens = Number(refAll.totalTokens);
+        else if (!grandTotalTokens && (totalInputTokens || totalOutputTokens || totalCacheTokens)) {
+          grandTotalTokens = totalInputTokens + totalOutputTokens + totalCacheTokens;
+        }
       }
     }
-    if (refAll) {
-      if (refAll.inputTokens && !totalInputTokens) totalInputTokens = Number(refAll.inputTokens);
-      if (refAll.cacheTokens && !totalCacheTokens) totalCacheTokens = Number(refAll.cacheTokens);
-      if (refAll.outputTokens && !totalOutputTokens) totalOutputTokens = Number(refAll.outputTokens);
-      if (refAll.totalTokens && !grandTotalTokens) grandTotalTokens = Number(refAll.totalTokens);
-      else if (!grandTotalTokens && (totalInputTokens || totalOutputTokens || totalCacheTokens)) {
-        grandTotalTokens = totalInputTokens + totalOutputTokens + totalCacheTokens;
-      }
-    }
+
+    const srcInfo = (source === 'desktop' || source === 'cli') ? payload.sources?.[source] : null;
+    const sourceConversations = srcInfo
+      ? Math.max(Number(srcInfo.conversationsCount) || 0, Number(srcInfo.transcriptsCount) || 0)
+      : (Number(rawSum.totalConversations) || activeDaysCount);
 
     const summary = {
       grandTotalTokens,
@@ -2471,12 +2478,12 @@
       currentMonthOutput,
       currentMonthCache,
       activeDaysCount,
-      totalConversations: Number(rawSum.totalConversations) || activeDaysCount,
+      totalConversations: sourceConversations,
       firstUseDate: payload.firstUseDate || rawSum.firstUseDate || null
     };
 
     let referenceCost = payload.referenceCost;
-    if (!referenceCost || !referenceCost.all || !referenceCost.currentMonth) {
+    if (source !== 'all' || !referenceCost || !referenceCost.all || !referenceCost.currentMonth) {
       const calcRefAll = calculateReferenceModelCost({
         inputTokens: totalInputTokens,
         outputTokens: totalOutputTokens,
@@ -2491,11 +2498,28 @@
         totalTokens: monthTokens
       }, modelId, { pricingDate, mode: 'all' });
 
+      const srcCostEst = payload.costEstimateBySource?.[source] || null;
+      const calcHybridAll = (source !== 'all' && srcCostEst && srcCostEst.byCategory)
+        ? calculateReferenceModelCost({
+          inputTokens: totalInputTokens,
+          outputTokens: totalOutputTokens,
+          cacheTokens: totalCacheTokens,
+          totalTokens: grandTotalTokens
+        }, modelId, {
+          pricingDate,
+          mode: 'unpriced_only',
+          knownUsage: {
+            byCategory: srcCostEst.byCategory,
+            costUSD: srcCostEst.pricedCostUSD
+          }
+        })
+        : (source === 'all' ? (referenceCost?.hybrid || calcRefAll) : calcRefAll);
+
       referenceCost = {
         all: calcRefAll,
         currentMonth: calcRefMonth,
-        hybrid: referenceCost?.hybrid || calcRefAll,
-        currentMonthHybrid: referenceCost?.currentMonthHybrid || calcRefMonth
+        hybrid: calcHybridAll,
+        currentMonthHybrid: source === 'all' ? (referenceCost?.currentMonthHybrid || calcRefMonth) : calcRefMonth
       };
     }
 
@@ -2509,6 +2533,7 @@
         label: `${currentMonthPrefix} (自然月)`,
         isCurrentMonth: true
       },
+      sources: payload.sources || null,
       planStatus: payload.planStatus || null,
       rawPlanStatus: payload.rawPlanStatus || payload.planStatus || null,
       customPlanSettings: payload.customPlanSettings || null,

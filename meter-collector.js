@@ -2070,6 +2070,11 @@ function savePluginSettings(payload = {}, options = {}) {
   if (typeof payload.panelLanguage === 'string' && validPanelLanguages.has(payload.panelLanguage)) {
     topLevelUiPrefs.panelLanguage = payload.panelLanguage;
   }
+  if (typeof payload.includeWslCli === 'boolean') {
+    topLevelUiPrefs.includeWslCli = payload.includeWslCli;
+  }
+  const prevIncludeWslCli = settings.uiPreferences?.includeWslCli;
+  const prevWslCliDirs = settings.uiPreferences?.wslCliDirs;
   const incomingUiPrefs = (payload.uiPreferences && typeof payload.uiPreferences === 'object' && !Array.isArray(payload.uiPreferences))
     ? { ...payload.uiPreferences, ...topLevelUiPrefs }
     : (Object.keys(topLevelUiPrefs).length > 0 ? topLevelUiPrefs : null);
@@ -2077,6 +2082,9 @@ function savePluginSettings(payload = {}, options = {}) {
   if (incomingUiPrefs) {
     if (incomingUiPrefs.panelLanguage !== undefined && !validPanelLanguages.has(incomingUiPrefs.panelLanguage)) {
       delete incomingUiPrefs.panelLanguage;
+    }
+    if (incomingUiPrefs.includeWslCli !== undefined && typeof incomingUiPrefs.includeWslCli !== 'boolean') {
+      delete incomingUiPrefs.includeWslCli;
     }
     const nextUi = {
       ...(settings.uiPreferences || {}),
@@ -2088,6 +2096,8 @@ function savePluginSettings(payload = {}, options = {}) {
     }
     settings.uiPreferences = nextUi;
   }
+  const wslSettingsChanged = (settings.uiPreferences?.includeWslCli !== prevIncludeWslCli)
+    || (JSON.stringify(settings.uiPreferences?.wslCliDirs ?? null) !== JSON.stringify(prevWslCliDirs ?? null));
 
   if (!settings.contextPreferences || typeof settings.contextPreferences !== 'object') {
     settings.contextPreferences = {};
@@ -2187,6 +2197,10 @@ function savePluginSettings(payload = {}, options = {}) {
   });
 
   // 同步更新内存缓存与 v2 归档中的 planStatus，确保刷新或重启即刻一致
+  if (wslSettingsChanged && !targetDir) {
+    invalidateHostLedgerAndHistoryCaches();
+    resetWslDiscoveryCacheForTest();
+  }
   if (!targetDir && cachedTokenHistory) {
     cachedTokenHistory.planStatus = effectivePlanStatus;
     cachedTokenHistory.customPlanSettings = activeCustom;
@@ -2485,14 +2499,370 @@ let cachedTokenHistoryScope = '';
 let currentScanSequence = 0;
 const TRANSCRIPT_SKIP_DIRS = new Set(['steps', 'tasks', 'scratch', 'media', 'artifacts', 'node_modules', '.git', '__pycache__']);
 const transcriptFileCache = new Map();
+const MAX_TRANSCRIPT_MEMORY_CACHE = 4000;
+const WSL_DISCOVERY_CACHE_TTL_MS = 300000;
+const IGNORED_WSL_DISTROS_RE = /^(docker-desktop(-data)?|rancher-desktop(-data)?|podman-machine.*|wsl-vpnkit)$/i;
+let wslDiscoveryCache = null;
+
+function resetWslDiscoveryCacheForTest() {
+  wslDiscoveryCache = null;
+}
+
+function normalizePathCompareKey(p) {
+  const resolved = path.resolve(String(p || ''));
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function inferWslMetaFromPath(cliPath) {
+  const s = String(cliPath || '');
+  const m = s.match(/^(?:\\\\|\/\/)wsl(?:\.localhost|\$)[\\/]([^\\/]+)[\\/](?:home[\\/]([^\\/]+)|root)(?:[\\/]|$)/i);
+  if (!m) return { distro: null, user: null };
+  return {
+    distro: m[1] || null,
+    user: m[2] || (/[/\\]root([/\\]|$)/i.test(s) ? 'root' : null)
+  };
+}
+
+function parseWslLxssRegistryOutput(regText) {
+  if (!regText || typeof regText !== 'string') return [];
+  const lines = regText.split(/\r?\n/);
+  let defaultGuid = null;
+  const entries = new Map();
+  let currentGuid = null;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const keyMatch = line.match(/^HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss(?:\\(\{[^}]+\}))?$/i);
+    if (keyMatch) {
+      currentGuid = keyMatch[1] ? keyMatch[1].toLowerCase() : null;
+      if (currentGuid && !entries.has(currentGuid)) {
+        entries.set(currentGuid, { guid: currentGuid, distro: '', version: 2, basePath: '', flavor: '', isDefault: false });
+      }
+      continue;
+    }
+    const valMatch = line.match(/^([^\s]+)\s+REG_(?:SZ|DWORD|EXPAND_SZ)\s+(.+)$/i);
+    if (!valMatch) continue;
+    const [, name, rawVal] = valMatch;
+    const val = rawVal.trim();
+    if (!currentGuid && name === 'DefaultDistribution') {
+      defaultGuid = val.toLowerCase();
+      continue;
+    }
+    if (!currentGuid) continue;
+    const entry = entries.get(currentGuid);
+    if (!entry) continue;
+    if (name === 'DistributionName') entry.distro = val;
+    else if (name === 'Version') {
+      const parsedVer = val.startsWith('0x') ? parseInt(val, 16) : Number(val);
+      if (Number.isFinite(parsedVer)) entry.version = parsedVer;
+    } else if (name === 'BasePath') entry.basePath = val;
+    else if (name === 'Flavor') entry.flavor = val;
+  }
+
+  const out = [];
+  for (const entry of entries.values()) {
+    if (!entry.distro || IGNORED_WSL_DISTROS_RE.test(entry.distro)) continue;
+    entry.isDefault = Boolean(defaultGuid && entry.guid === defaultGuid);
+    out.push(entry);
+  }
+  out.sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || a.distro.localeCompare(b.distro));
+  return out;
+}
+
+function parseWslListOutput(rawInput) {
+  if (!rawInput) return [];
+  let text = '';
+  if (Buffer.isBuffer(rawInput)) {
+    text = rawInput.includes(0) ? rawInput.toString('utf16le') : rawInput.toString('utf8');
+  } else {
+    text = String(rawInput);
+  }
+  const seen = new Set();
+  const out = [];
+  for (const rawLine of text.replace(/\uFEFF/g, '').split(/\r?\n/)) {
+    const cleaned = rawLine.replace(/\0/g, '').replace(/^\*\s*/, '').trim();
+    if (!cleaned || /^(NAME|名称)\b/i.test(cleaned)) continue;
+    const distro = cleaned.split(/\s{2,}|\t/)[0]?.trim();
+    if (!distro || IGNORED_WSL_DISTROS_RE.test(distro) || seen.has(distro.toLowerCase())) continue;
+    seen.add(distro.toLowerCase());
+    out.push({ distro, version: 2, basePath: '', flavor: '', isDefault: rawLine.trim().startsWith('*') });
+  }
+  return out;
+}
+
+function discoverWslDistros(options = {}) {
+  if (typeof options._regOutput === 'string') {
+    const parsed = parseWslLxssRegistryOutput(options._regOutput);
+    if (parsed.length > 0) return parsed;
+  }
+  if (options._wslListOutput !== undefined) {
+    return parseWslListOutput(options._wslListOutput);
+  }
+  if (process.platform !== 'win32') return [];
+  try {
+    const regOut = spawnSync('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss', '/s'], {
+      encoding: 'utf8',
+      timeout: 2000,
+      windowsHide: true
+    });
+    if (regOut.status === 0 && regOut.stdout) {
+      const parsed = parseWslLxssRegistryOutput(regOut.stdout);
+      if (parsed.length > 0) return parsed;
+    }
+  } catch { }
+  try {
+    const wslOut = spawnSync('wsl.exe', ['-l', '-q'], {
+      encoding: 'buffer',
+      timeout: 2000,
+      windowsHide: true
+    });
+    if (wslOut.status === 0 && wslOut.stdout) {
+      return parseWslListOutput(wslOut.stdout);
+    }
+  } catch { }
+  return [];
+}
+
+function isWslAutoDiscoverAllowed(options = {}) {
+  if (options.includeWslCli === true || options.autoDiscoverWsl === true) return true;
+  if (options.includeWslCli === false) return false;
+  if (options.agDir || options.agCliDir || process.env.AG_DIR || process.env.AG_CLI_DIR || process.env.NODE_TEST_CONTEXT) {
+    return false;
+  }
+  return process.platform === 'win32';
+}
+
+function findWslAntigravityCliDirs(options = {}) {
+  const customSettings = options.customSettings || {};
+  const uiPrefs = customSettings.uiPreferences || {};
+  const explicitWslDirsRaw = options.wslCliDirs ?? process.env.AG_WSL_CLI_DIRS ?? uiPrefs.wslCliDirs;
+  const hasExplicitWslDirs = Boolean(
+    (Array.isArray(explicitWslDirsRaw) && explicitWslDirsRaw.length > 0) ||
+    (typeof explicitWslDirsRaw === 'string' && explicitWslDirsRaw.trim())
+  );
+  const envDisable = process.env.AG_DISABLE_WSL_CLI === '1' || process.env.AG_DISABLE_WSL_CLI === 'true';
+  const prefEnabled = uiPrefs.includeWslCli !== false && !envDisable;
+  const enabled = typeof options.includeWslCli === 'boolean'
+    ? options.includeWslCli
+    : prefEnabled;
+
+  const isWin32 = process.platform === 'win32' || options._forceWin32 === true;
+  const supported = isWin32 || hasExplicitWslDirs;
+  if (!supported) {
+    return { supported: false, enabled: false, distros: [], dirs: [] };
+  }
+  if (!enabled) {
+    return { supported: true, enabled: false, distros: [], dirs: [] };
+  }
+
+  const fsImpl = options.fs || fs;
+  const excludeTarget = options.excludeCliDir || options.agCliDir;
+  const excludeNorm = excludeTarget ? normalizePathCompareKey(excludeTarget) : '';
+  const results = [];
+  const seenPaths = new Set();
+
+  const pushCandidateDir = (dirPath, distroHint = null, userHint = null) => {
+    if (!dirPath || typeof dirPath !== 'string') return;
+    const trimmed = dirPath.trim();
+    if (!trimmed) return;
+    const norm = normalizePathCompareKey(trimmed);
+    if ((excludeNorm && norm === excludeNorm) || seenPaths.has(norm)) return;
+    try {
+      if (!fsImpl.existsSync(trimmed) || !fsImpl.statSync(trimmed).isDirectory()) return;
+      seenPaths.add(norm);
+      const inferred = inferWslMetaFromPath(trimmed);
+      results.push({
+        path: trimmed,
+        distro: distroHint || inferred.distro || 'WSL',
+        user: userHint || inferred.user || null,
+        kind: 'wsl'
+      });
+    } catch { }
+  };
+
+  if (hasExplicitWslDirs) {
+    const rawList = Array.isArray(explicitWslDirsRaw)
+      ? explicitWslDirsRaw
+      : String(explicitWslDirsRaw).split(/[;,]/).map(s => s.trim()).filter(Boolean);
+    for (const item of rawList) {
+      pushCandidateDir(item);
+    }
+    return {
+      supported: true,
+      enabled: true,
+      distros: Array.from(new Set(results.map(r => r.distro).filter(Boolean))),
+      dirs: results
+    };
+  }
+
+  if (!isWslAutoDiscoverAllowed(options)) {
+    return { supported: isWin32, enabled: true, distros: [], dirs: [] };
+  }
+
+  const now = Date.now();
+  if (!options._skipDiscoveryCache && wslDiscoveryCache && (now - wslDiscoveryCache.at < WSL_DISCOVERY_CACHE_TTL_MS)) {
+    if (!options.force || (now - wslDiscoveryCache.at < 10000)) {
+      return wslDiscoveryCache.value;
+    }
+  }
+
+  const distros = discoverWslDistros(options);
+  const discoveredDistros = [];
+  for (const d of distros) {
+    const distro = d.distro;
+    const rootCandidates = Array.isArray(options._wslRootCandidatesForDistro?.(distro))
+      ? options._wslRootCandidatesForDistro(distro)
+      : [`\\\\wsl.localhost\\${distro}`, `\\\\wsl$\\${distro}`];
+    if (d.version === 1 && d.basePath) {
+      rootCandidates.push(path.join(d.basePath, 'rootfs'));
+    }
+    let activeRoot = null;
+    for (const root of rootCandidates) {
+      try {
+        if (fsImpl.existsSync(root)) {
+          activeRoot = root;
+          break;
+        }
+      } catch { }
+    }
+    if (!activeRoot) continue;
+    discoveredDistros.push(distro);
+
+    const homeDir = path.join(activeRoot, 'home');
+    try {
+      if (fsImpl.existsSync(homeDir)) {
+        const users = fsImpl.readdirSync(homeDir, { withFileTypes: true });
+        for (const u of users) {
+          if (!u.isDirectory() || u.name.startsWith('.')) continue;
+          pushCandidateDir(path.join(homeDir, u.name, '.gemini', 'antigravity-cli'), distro, u.name);
+        }
+      }
+    } catch { }
+    pushCandidateDir(path.join(activeRoot, 'root', '.gemini', 'antigravity-cli'), distro, 'root');
+  }
+
+  const value = {
+    supported: true,
+    enabled: true,
+    distros: discoveredDistros,
+    dirs: results
+  };
+  if (!options._skipDiscoveryCache) {
+    wslDiscoveryCache = { at: now, value };
+  }
+  return value;
+}
+
+function mergeDailyMaps(...maps) {
+  const out = {};
+  for (const m of maps) {
+    if (!m || typeof m !== 'object') continue;
+    for (const [k, rec] of Object.entries(m)) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(k) || !rec) continue;
+      if (!out[k]) {
+        out[k] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+      }
+      out[k].total += Number(rec.total) || 0;
+      out[k].input += Number(rec.input) || 0;
+      out[k].output += Number(rec.output) || 0;
+      out[k].cache += Number(rec.cache) || 0;
+      out[k].steps += Number(rec.steps) || 0;
+    }
+  }
+  return out;
+}
+
+function sumDailyMapTokens(mapObj) {
+  let total = 0;
+  if (!mapObj || typeof mapObj !== 'object') return 0;
+  for (const rec of Object.values(mapObj)) {
+    total += Number(rec?.total) || 0;
+  }
+  return total;
+}
+
+function parseTranscriptFileContent(content, jobPath) {
+  const records = [];
+  let minCreatedAt = null;
+  let minCreatedMs = Infinity;
+  const brainMatch = String(jobPath).match(/[\\/]brain[\\/]([^\\/]+)[\\/]/i);
+  const lines = content.split(/\r?\n/);
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line || !line.trim()) continue;
+    let event = null;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!event || !event.created_at) continue;
+    const d = new Date(event.created_at);
+    const tsMs = d.getTime();
+    if (Number.isNaN(tsMs)) continue;
+    if (tsMs < minCreatedMs) {
+      minCreatedMs = tsMs;
+      minCreatedAt = event.created_at;
+    }
+
+    let inp = 0, outp = 0, cap = 0, thinking = 0;
+    const model = event.chatModel?.model || event.chatModel?.responseModel || event.model || event.modelId || '';
+    if (event.input_tokens != null || event.output_tokens != null || event.cache_read_tokens != null) {
+      inp = Number(event.input_tokens || 0);
+      outp = Number(event.output_tokens || 0);
+      cap = Number(event.cache_read_tokens || 0);
+      thinking = Number(event.thinking_output_tokens || 0);
+    } else if (event.chatModel?.usage) {
+      const u = event.chatModel.usage;
+      inp = Number(u.inputTokens || 0);
+      outp = Number(u.outputTokens || 0);
+      cap = Number(u.cacheReadTokens || 0);
+      thinking = Number(u.thinkingOutputTokens || 0);
+    }
+
+    const tot = inp + outp + cap;
+    if (tot > 0) {
+      // 唯一事件标识去重 (避免复制/软链接/重复日志相加)
+      const cascadeId = String(event.cascadeId || (brainMatch ? brainMatch[1] : path.basename(jobPath, '.jsonl')));
+      const rawStep = event.step_index ?? event.stepIndex;
+      const parsedStep = rawStep !== undefined && rawStep !== null && rawStep !== '' ? Number(rawStep) : NaN;
+      const stepIndex = Number.isInteger(parsedStep) && parsedStep >= 0 ? parsedStep : null;
+      const fallbackScope = (event.cascadeId || brainMatch) ? cascadeId : jobPath;
+      const eventId = extractCallId(event, fallbackScope, stepIndex ?? i);
+
+      records.push({
+        eventId,
+        cascadeId,
+        stepIndex,
+        model,
+        inp,
+        outp,
+        cap,
+        thinking,
+        tot,
+        created_at: event.created_at
+      });
+    }
+  }
+  return { minCreatedAt, records };
+}
 
 function getEffectiveScanScopeKey(options = {}) {
   const home = process.env.USERPROFILE || os.homedir();
   const agDir = path.resolve(options.agDir || process.env.AG_DIR || path.join(home, '.gemini', 'antigravity'));
   const agCliDir = path.resolve(options.agCliDir || process.env.AG_CLI_DIR || path.join(home, '.gemini', 'antigravity-cli'));
-  return process.platform === 'win32'
+  let wslFlag = options.includeWslCli;
+  if (typeof wslFlag !== 'boolean') {
+    const uiPrefs = loadCustomPlanSettings(agDir).uiPreferences || {};
+    wslFlag = uiPrefs.includeWslCli !== false;
+  }
+  const explicitWsl = options.wslCliDirs ? JSON.stringify(options.wslCliDirs) : (process.env.AG_WSL_CLI_DIRS || '');
+  const base = process.platform === 'win32'
     ? `${agDir.toLowerCase()}|${agCliDir.toLowerCase()}`
     : `${agDir}|${agCliDir}`;
+  return `${base}|wsl:${wslFlag ? '1' : '0'}|${explicitWsl}`;
 }
 
 function isFsMonkeyPatched() {
@@ -2709,6 +3079,13 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
   const home = process.env.USERPROFILE || os.homedir();
   const agDir = options.agDir || process.env.AG_DIR || path.join(home, '.gemini', 'antigravity');
   const agCliDir = options.agCliDir || process.env.AG_CLI_DIR || path.join(home, '.gemini', 'antigravity-cli');
+  const customSettingsAll = loadCustomPlanSettings(agDir);
+  const wslDiscovery = findWslAntigravityCliDirs({
+    ...options,
+    excludeCliDir: agCliDir,
+    customSettings: customSettingsAll
+  });
+  const wslEnabled = Boolean(wslDiscovery.enabled);
 
   const brainDir = path.join(agDir, 'brain');
   const convDir = path.join(agDir, 'conversations');
@@ -2728,8 +3105,9 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
     }
   }
 
-  // 2. 读取已有的 v2 归档
+  // 2. 读取已有的 v2 归档与 CLI 源拆分旁路归档（防止旧版宿主覆写 v2 后丢失 cliLocal/cliWsl 拆分信息）
   const bakPathV2 = path.join(agDir, 'token_usage_archive_v2.bak.json');
+  const cliSplitArchivePath = path.join(agDir, 'cli_source_split_v1.json');
   const readV2 = safeReadJsonSync(archivePathV2, null, { backupPath: bakPathV2 });
   let archiveV2 = {
     version: '2.0.0',
@@ -2749,6 +3127,10 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
       }
     }
   }
+  const readCliSplit = safeReadJsonSync(cliSplitArchivePath, null);
+  const cliSplitArchive = (readCliSplit.exists && readCliSplit.ok && readCliSplit.data && typeof readCliSplit.data === 'object')
+    ? readCliSplit.data
+    : null;
 
   let earliestDate = archiveV2.firstUseDate || legacyV1Archive.firstUseDate || null;
   const registerDate = (dateStr) => {
@@ -2757,10 +3139,11 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
     }
   };
 
-  // 3. 扫描桌面端与 CLI 会话文件（忽略 -wal/-shm/-journal 等伴生文件）
+  // 3. 扫描桌面端与 CLI（本地 + WSL）会话文件（忽略 -wal/-shm/-journal 等伴生文件）
   let desktopPbCount = 0;
-  let cliPbCount = 0;
-  const scanSessionDir = (dir, isCli = false) => {
+  let localCliPbCount = 0;
+  let wslCliPbCount = 0;
+  const scanSessionDir = (dir) => {
     let count = 0;
     try {
       if (!fs.existsSync(dir)) return 0;
@@ -2781,16 +3164,34 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
     return count;
   };
 
-  desktopPbCount = scanSessionDir(convDir, false);
+  desktopPbCount = scanSessionDir(convDir);
   if (fs.existsSync(path.join(agCliDir, 'conversations'))) {
-    cliPbCount = scanSessionDir(path.join(agCliDir, 'conversations'), true);
+    localCliPbCount = scanSessionDir(path.join(agCliDir, 'conversations'));
   }
 
-  // 4. 双目录遍历扫描 transcript.jsonl（跳过 steps/scratch 重型目录，软链接与环路去重）
+  const wslStatsByPath = new Map();
+  for (const wslDir of wslDiscovery.dirs) {
+    const convCount = fs.existsSync(path.join(wslDir.path, 'conversations'))
+      ? scanSessionDir(path.join(wslDir.path, 'conversations'))
+      : 0;
+    wslCliPbCount += convCount;
+    wslStatsByPath.set(wslDir.path, {
+      distro: wslDir.distro,
+      user: wslDir.user,
+      path: wslDir.path,
+      conversationsCount: convCount,
+      transcriptsCount: 0,
+      tokens: 0,
+      steps: 0
+    });
+  }
+  const cliPbCount = localCliPbCount + wslCliPbCount;
+
+  // 4. 多目录遍历扫描 transcript.jsonl（跳过 steps/scratch 重型目录，软链接与环路去重）
   const visitedRealDirs = new Set();
   const transcriptJobs = [];
 
-  const walkTranscripts = (dir, sourceName, depth = 0) => {
+  const walkTranscripts = (dir, sourceName, depth = 0, meta = {}) => {
     if (depth > 4) return;
     try {
       if (!fs.existsSync(dir)) return;
@@ -2807,10 +3208,10 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
             const st = fs.statSync(realTarget);
             if (st.isDirectory()) {
               if (!visitedRealDirs.has(realTarget)) {
-                walkTranscripts(realTarget, sourceName, depth + 1);
+                walkTranscripts(realTarget, sourceName, depth + 1, meta);
               }
             } else if (entry.name === 'transcript.jsonl') {
-              transcriptJobs.push({ path: realTarget, source: sourceName });
+              transcriptJobs.push({ path: realTarget, source: sourceName, ...meta });
             }
           } catch { }
         } else if (entry.isDirectory()) {
@@ -2819,31 +3220,136 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
             const directLogPath = path.join(fullPath, 'transcript.jsonl');
             let matchedFast = false;
             if (fs.existsSync(stdLogPath)) {
-              transcriptJobs.push({ path: stdLogPath, source: sourceName });
+              transcriptJobs.push({ path: stdLogPath, source: sourceName, ...meta });
               matchedFast = true;
             }
             if (fs.existsSync(directLogPath)) {
-              transcriptJobs.push({ path: directLogPath, source: sourceName });
+              transcriptJobs.push({ path: directLogPath, source: sourceName, ...meta });
               matchedFast = true;
             }
             if (matchedFast) continue;
           }
-          walkTranscripts(fullPath, sourceName, depth + 1);
+          walkTranscripts(fullPath, sourceName, depth + 1, meta);
         } else if (entry.name === 'transcript.jsonl') {
-          transcriptJobs.push({ path: fullPath, source: sourceName });
+          transcriptJobs.push({ path: fullPath, source: sourceName, ...meta });
         }
       }
     } catch { }
   };
 
-  walkTranscripts(brainDir, 'desktop');
+  walkTranscripts(brainDir, 'desktop', 0, { subSource: 'desktop' });
   if (fs.existsSync(path.join(agCliDir, 'brain'))) {
-    walkTranscripts(path.join(agCliDir, 'brain'), 'cli');
+    walkTranscripts(path.join(agCliDir, 'brain'), 'cli', 0, { subSource: 'cli_local' });
+  }
+  for (const wslDir of wslDiscovery.dirs) {
+    const wslBrain = path.join(wslDir.path, 'brain');
+    if (fs.existsSync(wslBrain)) {
+      const beforeCount = transcriptJobs.length;
+      walkTranscripts(wslBrain, 'cli', 0, { subSource: 'cli_wsl', wslPath: wslDir.path, distro: wslDir.distro });
+      const statEntry = wslStatsByPath.get(wslDir.path);
+      if (statEntry) {
+        statEntry.transcriptsCount = transcriptJobs.length - beforeCount;
+      }
+    }
   }
 
-  // 5. 结构化 JSON 解析 transcript.jsonl（基于 size+mtimeMs 单文件增量缓存，去重并汇总）
+  // 5. 结构化 JSON 解析 transcript.jsonl（支持轻量级磁盘缓存与并发读取，基于 size+mtimeMs 去重汇总）
+  const useDiskCache = options.useTranscriptDiskCache === true ||
+    (!process.env.NODE_TEST_CONTEXT && options.useTranscriptDiskCache !== false && !options.fs && !isFsMonkeyPatched());
+  const transcriptCachePath = path.join(agDir, 'transcript_scan_cache_v1.json');
+  let diskCacheDirty = false;
+
+  if (useDiskCache && transcriptFileCache.size === 0) {
+    try {
+      const diskCacheRead = safeReadJsonSync(transcriptCachePath, null);
+      if (diskCacheRead.exists && diskCacheRead.ok && diskCacheRead.data?.version === 1 && diskCacheRead.data.files && typeof diskCacheRead.data.files === 'object') {
+        for (const [fPath, entry] of Object.entries(diskCacheRead.data.files)) {
+          if (!entry || typeof entry !== 'object' || !Array.isArray(entry.records)) continue;
+          transcriptFileCache.set(fPath, {
+            size: Number(entry.size) || 0,
+            mtimeMs: Number(entry.mtimeMs) || 0,
+            minCreatedAt: entry.minCreatedAt || null,
+            records: entry.records
+          });
+        }
+      }
+    } catch { }
+  }
+
+  const parsedJobEntries = new Array(transcriptJobs.length).fill(null);
+  const canConcurrentAsyncRead = !isFsMonkeyPatched() && !options.fs && fs.promises && typeof fs.promises.readFile === 'function';
+
+  if (canConcurrentAsyncRead && transcriptJobs.length > 0) {
+    const concurrency = Math.min(12, transcriptJobs.length);
+    let cursor = 0;
+    const workerFn = async () => {
+      while (cursor < transcriptJobs.length) {
+        const idx = cursor++;
+        const job = transcriptJobs[idx];
+        try {
+          const st = await fs.promises.stat(job.path);
+          const cachedFile = transcriptFileCache.get(job.path);
+          if (cachedFile && cachedFile.size === st.size && cachedFile.mtimeMs === st.mtimeMs) {
+            parsedJobEntries[idx] = { minCreatedAt: cachedFile.minCreatedAt || null, records: cachedFile.records };
+            continue;
+          }
+          const content = await fs.promises.readFile(job.path, 'utf8');
+          const parsed = parseTranscriptFileContent(content, job.path);
+          parsedJobEntries[idx] = { ...parsed, size: st.size, mtimeMs: st.mtimeMs, dirty: true };
+        } catch { }
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, workerFn));
+    for (let idx = 0; idx < transcriptJobs.length; idx++) {
+      const item = parsedJobEntries[idx];
+      if (!item || !item.dirty) continue;
+      diskCacheDirty = true;
+      if (transcriptFileCache.size > MAX_TRANSCRIPT_MEMORY_CACHE) {
+        const oldestKey = transcriptFileCache.keys().next().value;
+        if (oldestKey) transcriptFileCache.delete(oldestKey);
+      }
+      transcriptFileCache.set(transcriptJobs[idx].path, {
+        size: item.size,
+        mtimeMs: item.mtimeMs,
+        minCreatedAt: item.minCreatedAt,
+        records: item.records
+      });
+    }
+  } else {
+    for (let jIdx = 0; jIdx < transcriptJobs.length; jIdx++) {
+      const job = transcriptJobs[jIdx];
+      if (jIdx > 0 && jIdx % 15 === 0) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      try {
+        const st = fs.statSync(job.path);
+        const cachedFile = transcriptFileCache.get(job.path);
+        if (cachedFile && cachedFile.size === st.size && cachedFile.mtimeMs === st.mtimeMs) {
+          parsedJobEntries[jIdx] = { minCreatedAt: cachedFile.minCreatedAt || null, records: cachedFile.records };
+        } else {
+          const content = fs.readFileSync(job.path, 'utf8');
+          const parsed = parseTranscriptFileContent(content, job.path);
+          diskCacheDirty = true;
+          if (transcriptFileCache.size > MAX_TRANSCRIPT_MEMORY_CACHE) {
+            const oldestKey = transcriptFileCache.keys().next().value;
+            if (oldestKey) transcriptFileCache.delete(oldestKey);
+          }
+          transcriptFileCache.set(job.path, {
+            size: st.size,
+            mtimeMs: st.mtimeMs,
+            minCreatedAt: parsed.minCreatedAt,
+            records: parsed.records
+          });
+          parsedJobEntries[jIdx] = parsed;
+        }
+      } catch { }
+    }
+  }
+
   const scannedBySource = {
     desktop: {},
+    cliLocal: {},
+    cliWsl: {},
     cli: {}
   };
   const seenEvents = new Set();
@@ -2851,148 +3357,113 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
 
   for (let jIdx = 0; jIdx < transcriptJobs.length; jIdx++) {
     const job = transcriptJobs[jIdx];
-    if (jIdx > 0 && jIdx % 15 === 0) {
-      await new Promise(resolve => setImmediate(resolve));
+    const parsed = parsedJobEntries[jIdx];
+    if (!parsed) continue;
+    if (parsed.minCreatedAt) {
+      const minD = new Date(parsed.minCreatedAt);
+      if (!Number.isNaN(minD.getTime())) registerDate(formatLocalDateKey(minD));
     }
-    try {
-      const st = fs.statSync(job.path);
-      const cachedFile = transcriptFileCache.get(job.path);
-      let fileRecords = null;
+    const fileRecords = parsed.records || [];
+    for (let rIdx = 0; rIdx < fileRecords.length; rIdx++) {
+      const rec = fileRecords[rIdx];
+      const parsedDate = new Date(rec.created_at);
+      if (Number.isNaN(parsedDate.getTime())) continue;
+      const dateKey = formatLocalDateKey(parsedDate);
+      registerDate(dateKey);
+      if (!rec.tot || !rec.eventId) continue;
+      if (seenEvents.has(rec.eventId)) continue;
+      seenEvents.add(rec.eventId);
 
-      if (cachedFile && cachedFile.size === st.size && cachedFile.mtimeMs === st.mtimeMs) {
-        fileRecords = cachedFile.records;
-      } else {
-        fileRecords = [];
-        const brainMatch = String(job.path).match(/[\\/]brain[\\/]([^\\/]+)[\\/]/i);
-        const content = fs.readFileSync(job.path, 'utf8');
-        const lines = content.split(/\r?\n/);
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i];
-          if (!line || !line.trim()) continue;
-          let event = null;
-          try {
-            event = JSON.parse(line);
-          } catch {
-            continue;
-          }
+      const addDaily = (targetMap) => {
+        if (!targetMap[dateKey]) {
+          targetMap[dateKey] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+        }
+        targetMap[dateKey].total += rec.tot;
+        targetMap[dateKey].input += rec.inp;
+        targetMap[dateKey].output += rec.outp;
+        targetMap[dateKey].cache += rec.cap;
+        targetMap[dateKey].steps += 1;
+      };
 
-          let hasValidCreatedAt = false;
-          if (event.created_at) {
-            const d = new Date(event.created_at);
-            if (!Number.isNaN(d.getTime())) {
-              hasValidCreatedAt = true;
+      if (job.source === 'cli') {
+        addDaily(scannedBySource.cli);
+        if (job.subSource === 'cli_wsl') {
+          addDaily(scannedBySource.cliWsl);
+          if (job.wslPath) {
+            const wStat = wslStatsByPath.get(job.wslPath);
+            if (wStat) {
+              wStat.tokens += rec.tot;
+              wStat.steps += 1;
             }
           }
-          if (!hasValidCreatedAt) continue;
-
-          let inp = 0, outp = 0, cap = 0, thinking = 0;
-          const model = event.chatModel?.model || event.chatModel?.responseModel || event.model || event.modelId || '';
-
-          if (event.input_tokens != null || event.output_tokens != null || event.cache_read_tokens != null) {
-            inp = Number(event.input_tokens || 0);
-            outp = Number(event.output_tokens || 0);
-            cap = Number(event.cache_read_tokens || 0);
-            thinking = Number(event.thinking_output_tokens || 0);
-          } else if (event.chatModel?.usage) {
-            const u = event.chatModel.usage;
-            inp = Number(u.inputTokens || 0);
-            outp = Number(u.outputTokens || 0);
-            cap = Number(u.cacheReadTokens || 0);
-            thinking = Number(u.thinkingOutputTokens || 0);
-          }
-
-          const tot = inp + outp + cap;
-          if (tot > 0) {
-            // 唯一事件标识去重 (避免复制/软链接/重复日志相加)
-            const cascadeId = String(event.cascadeId || (brainMatch ? brainMatch[1] : path.basename(job.path, '.jsonl')));
-            const rawStep = event.step_index ?? event.stepIndex;
-            const parsedStep = rawStep !== undefined && rawStep !== null && rawStep !== '' ? Number(rawStep) : NaN;
-            const stepIndex = Number.isInteger(parsedStep) && parsedStep >= 0 ? parsedStep : null;
-            const fallbackScope = (event.cascadeId || brainMatch) ? cascadeId : job.path;
-            const eventId = extractCallId(event, fallbackScope, stepIndex ?? i);
-
-            fileRecords.push({
-              eventId,
-              cascadeId,
-              stepIndex,
-              model,
-              inp,
-              outp,
-              cap,
-              thinking,
-              tot,
-              created_at: event.created_at
-            });
-          } else {
-            fileRecords.push({
-              tot: 0,
-              created_at: event.created_at
-            });
-          }
+        } else {
+          addDaily(scannedBySource.cliLocal);
         }
-        if (transcriptFileCache.size > 1000) {
-          const oldestKey = transcriptFileCache.keys().next().value;
-          if (oldestKey) transcriptFileCache.delete(oldestKey);
-        }
-        transcriptFileCache.set(job.path, { size: st.size, mtimeMs: st.mtimeMs, records: fileRecords });
+      } else {
+        addDaily(scannedBySource.desktop);
       }
 
-      for (let rIdx = 0; rIdx < fileRecords.length; rIdx++) {
-        const rec = fileRecords[rIdx];
-        const parsedDate = new Date(rec.created_at);
-        if (Number.isNaN(parsedDate.getTime())) continue;
-        const dateKey = formatLocalDateKey(parsedDate);
-        registerDate(dateKey);
-        if (!rec.tot || !rec.eventId) continue;
-        if (seenEvents.has(rec.eventId)) continue;
-        seenEvents.add(rec.eventId);
+      const modelKey = normalizeModelId(rec.model);
+      const reqObj = {
+        callId: rec.eventId,
+        source: job.source,
+        ...(job.subSource === 'cli_wsl' ? { cliOrigin: 'wsl', ...(job.distro ? { wslDistro: job.distro } : {}) } : {}),
+        cascadeId: rec.cascadeId,
+        stepIndex: rec.stepIndex,
+        model: rec.model,
+        modelKey,
+        inputTokens: rec.inp,
+        cacheTokens: rec.cap,
+        cacheReadTokens: rec.cap,
+        outputTokens: rec.outp,
+        thinkingTokens: rec.thinking,
+        totalTokens: rec.tot,
+        status: 'final',
+        isEstimated: false,
+        date: dateKey,
+        dateSource: 'transcript',
+        dateIsProvisional: false,
+        created_at: rec.created_at || null,
+        timestamp: parsedDate.getTime()
+      };
+      const costCalc = calculateRequestApiCost(reqObj);
+      reqObj.isPriced = costCalc.isPriced;
+      reqObj.costUSD = costCalc.costUSD ?? 0;
 
-        const srcMap = scannedBySource[job.source] || scannedBySource.desktop;
-        if (!srcMap[dateKey]) {
-          srcMap[dateKey] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
-        }
-        srcMap[dateKey].total += rec.tot;
-        srcMap[dateKey].input += rec.inp;
-        srcMap[dateKey].output += rec.outp;
-        srcMap[dateKey].cache += rec.cap;
-        srcMap[dateKey].steps += 1;
-
-        const modelKey = normalizeModelId(rec.model);
-        const reqObj = {
-          callId: rec.eventId,
-          source: job.source,
-          cascadeId: rec.cascadeId,
-          stepIndex: rec.stepIndex,
-          model: rec.model,
-          modelKey,
-          inputTokens: rec.inp,
-          cacheTokens: rec.cap,
-          cacheReadTokens: rec.cap,
-          outputTokens: rec.outp,
-          thinkingTokens: rec.thinking,
-          totalTokens: rec.tot,
-          status: 'final',
-          isEstimated: false,
-          date: dateKey,
-          dateSource: 'transcript',
-          dateIsProvisional: false,
-          created_at: rec.created_at || null,
-          timestamp: parsedDate.getTime()
-        };
-        const costCalc = calculateRequestApiCost(reqObj);
-        reqObj.isPriced = costCalc.isPriced;
-        reqObj.costUSD = costCalc.costUSD ?? 0;
-
-        recentRequests.push(reqObj);
-      }
-    } catch { }
+      recentRequests.push(reqObj);
+    }
   }
 
-  // 6. 与旧归档做差异合并，防止简单相加或 Math.max 抹杀 CLI 增量
+  // 6. 与旧归档做差异合并，同时区分 cliLocal 与 cliWsl 以便动态开关无残留且绝不重复叠加
   // 规则：若 (desktop + cli) < legacyV1，则把差额保留为 legacyUnallocated；否则认为已被新日志完全覆盖
   const legacyDaily = legacyV1Archive.dailyMap || {};
+  const legacyV1WslMap = (legacyV1Archive.cliWslIncluded && typeof legacyV1Archive.cliWslIncluded === 'object')
+    ? legacyV1Archive.cliWslIncluded
+    : null;
   const mergedDesktop = { ...(archiveV2.dailyMapBySource?.desktop || {}), ...scannedBySource.desktop };
-  const mergedCli = { ...(archiveV2.dailyMapBySource?.cli || {}), ...scannedBySource.cli };
+  const hasSplitInV2 = Boolean(
+    archiveV2.dailyMapBySource &&
+    (archiveV2.dailyMapBySource.cliLocal || archiveV2.dailyMapBySource.cliWsl)
+  );
+  const splitSource = hasSplitInV2 ? archiveV2.dailyMapBySource : cliSplitArchive;
+  let baseCliLocal = {};
+  let baseCliWsl = {};
+  if (splitSource) {
+    baseCliLocal = splitSource.cliLocal || {};
+    baseCliWsl = splitSource.cliWsl || {};
+  } else {
+    // 兼容无拆分记录的旧版 v2 归档：若某个日期已被本次 WSL/本地扫描覆盖，则不将其旧 cli 归档重复归入 cliLocal
+    const legacyV2Cli = archiveV2.dailyMapBySource?.cli || {};
+    for (const [dk, dVal] of Object.entries(legacyV2Cli)) {
+      if (!scannedBySource.cli[dk]) {
+        baseCliLocal[dk] = dVal;
+      }
+    }
+  }
+  const mergedCliLocal = { ...baseCliLocal, ...scannedBySource.cliLocal };
+  const savedCliWsl = { ...baseCliWsl, ...scannedBySource.cliWsl };
+  const effectiveCliWsl = wslEnabled ? savedCliWsl : {};
+  const mergedCli = mergeDailyMaps(mergedCliLocal, effectiveCliWsl);
   const mergedLegacyUnallocated = {};
 
   const allDateKeys = new Set([
@@ -3007,7 +3478,17 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
     registerDate(k);
     const dRec = mergedDesktop[k] || { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
     const cRec = mergedCli[k] || { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
-    const lRec = legacyDaily[k] || { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+    const rawLRec = legacyDaily[k] || { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+    const v1WslSub = (!wslEnabled && legacyV1WslMap?.[k]) ? legacyV1WslMap[k] : null;
+    const lRec = v1WslSub
+      ? {
+          total: Math.max(0, (rawLRec.total || 0) - (v1WslSub.total || 0)),
+          input: Math.max(0, (rawLRec.input || 0) - (v1WslSub.input || 0)),
+          output: Math.max(0, (rawLRec.output || 0) - (v1WslSub.output || 0)),
+          cache: Math.max(0, (rawLRec.cache || 0) - (v1WslSub.cache || 0)),
+          steps: Math.max(0, (rawLRec.steps || 0) - (v1WslSub.steps || 0))
+        }
+      : rawLRec;
 
     const scannedSum = (dRec.total || 0) + (cRec.total || 0);
     let unallocatedDiff = Math.max(0, (lRec.total || 0) - scannedSum);
@@ -3079,7 +3560,6 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
     livePlanStatus = archiveV2.planStatus || parseUserPlanStatus(null);
   }
 
-  const customSettingsAll = loadCustomPlanSettings(agDir);
   const currentAccountKey = livePlanStatus?.email || archiveV2.planStatus?.email || null;
   const currentCustom = resolveAccountCustomPlan(customSettingsAll, currentAccountKey);
 
@@ -3354,8 +3834,10 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
     }
   }
 
+  const isCallIncluded = (c) => Boolean(c) && (wslEnabled || c.cliOrigin !== 'wsl');
   const finalCallsEntries = Object.entries(effectiveCallsMap);
-  const mergedCalls = finalCallsEntries.map(([, c]) => c);
+  const visibleCallsEntries = finalCallsEntries.filter(([, c]) => isCallIncluded(c));
+  const mergedCalls = visibleCallsEntries.map(([, c]) => c);
 
   const resolveLedgerCallDate = (ledgerKey, c) => {
     const mapped = callEffectiveDate.get(ledgerKey);
@@ -3367,7 +3849,7 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
 
   // 按来源与日期汇总未匹配任何实时 transcript 的账本调用，用于抵扣 v2 / v1 历史归档中已被账本覆盖的份额
   const unmatchedLedgerBySourceDate = new Map();
-  for (const [ledgerKey, c] of finalCallsEntries) {
+  for (const [ledgerKey, c] of visibleCallsEntries) {
     if (!c || matchedLedgerKeys.has(ledgerKey)) continue;
     const effDate = resolveLedgerCallDate(ledgerKey, c);
     if (!effDate || !/^\d{4}-\d{2}-\d{2}$/.test(effDate)) continue;
@@ -3462,7 +3944,7 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
   const costEstimateCli = summarizeApiCost(mergedCalls.filter(c => c.source === 'cli'), cliUnpriced.count, cliUnpriced.reasons, cliUnpriced.tokens);
 
   // 本期 (本月自然月) 账本过滤与计价分析（仅追加未被账本覆盖的本月剩余步骤与 v2/v1 遗留差额）
-  const currentMonthCalls = finalCallsEntries
+  const currentMonthCalls = visibleCallsEntries
     .filter(([ledgerKey, c]) => {
       if (!c) return false;
       const effDate = resolveLedgerCallDate(ledgerKey, c);
@@ -3627,6 +4109,9 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
   const prevAccountEmail = Object.prototype.hasOwnProperty.call(extraContext, 'prevAccountEmail')
     ? extraContext.prevAccountEmail
     : (collectTokenHistoryAsync._lastAccountEmail || null);
+  const wslDirsMeta = Array.from(wslStatsByPath.values());
+  const localCliTranscriptsCount = transcriptJobs.filter(j => j.source === 'cli' && j.subSource !== 'cli_wsl').length;
+  const wslCliTranscriptsCount = transcriptJobs.filter(j => j.source === 'cli' && j.subSource === 'cli_wsl').length;
   const out = {
     schemaVersion: '0.8.5',
     version: '0.8.5',
@@ -3655,9 +4140,17 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
         transcriptsCount: transcriptJobs.filter(j => j.source === 'desktop').length
       },
       cli: {
-        dirExists: fs.existsSync(agCliDir),
+        dirExists: fs.existsSync(agCliDir) || wslDirsMeta.length > 0,
+        localDirExists: fs.existsSync(agCliDir),
         conversationsCount: cliPbCount,
-        transcriptsCount: transcriptJobs.filter(j => j.source === 'cli').length
+        localConversationsCount: localCliPbCount,
+        wslConversationsCount: wslCliPbCount,
+        transcriptsCount: localCliTranscriptsCount + wslCliTranscriptsCount,
+        localTranscriptsCount: localCliTranscriptsCount,
+        wslTranscriptsCount: wslCliTranscriptsCount,
+        wslSupported: wslDiscovery.supported,
+        wslEnabled,
+        wslDirs: wslDirsMeta
       }
     },
     planStatus: effectivePlanStatus,
@@ -3706,11 +4199,13 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
       all: dailyMapAll,
       desktop: mergedDesktop,
       cli: mergedCli,
+      cliLocal: mergedCliLocal,
+      cliWsl: effectiveCliWsl,
       legacyUnallocated: mergedLegacyUnallocated
     }
   };
 
-  const archiveSig = `${agDir}|${earliestDate}|${totalConversations}|${grandTotalTokens}|${totalSteps}|${effectivePlanStatus?.tierKey || ''}|${effectivePlanStatus?.actualPricePaid ?? ''}|${effectivePlanStatus?.currency || ''}|${costEstimate?.pricedCostUSD ?? ''}`;
+  const archiveSig = `${agDir}|${earliestDate}|${totalConversations}|${grandTotalTokens}|${totalSteps}|${wslEnabled ? '1' : '0'}|${wslCliTranscriptsCount}|${effectivePlanStatus?.tierKey || ''}|${effectivePlanStatus?.actualPricePaid ?? ''}|${effectivePlanStatus?.currency || ''}|${costEstimate?.pricedCostUSD ?? ''}`;
   const isStaleCheck = typeof extraContext.isStale === 'function' ? extraContext.isStale : null;
   if (isStaleCheck && isStaleCheck()) {
     return { out, archiveSig: null, accountKey: currentAccountKey || null, stale: true };
@@ -3732,20 +4227,51 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
         costEstimate,
         costEstimateCurrentMonth,
         referenceCost: out.referenceCost,
-        dailyMapBySource: out.dailyMapBySource
+        dailyMapBySource: {
+          ...out.dailyMapBySource,
+          cliWsl: savedCliWsl
+        }
       };
       safeWriteJsonSync(archivePathV2, v2Payload);
 
-      // 同时写回 v1 格式以保持向下完全兼容
+      // 同时写回 v1 格式以保持向下完全兼容，并附带 cliWslIncluded 避免关闭 WSL 后遗留误计入 unallocated
       const v1Payload = {
         firstUseDate: earliestDate,
         maxConversations: totalConversations,
         updatedAt: out.updatedAt,
-        dailyMap: dailyMapAll
+        dailyMap: dailyMapAll,
+        ...(Object.keys(effectiveCliWsl).length > 0 ? { cliWslIncluded: effectiveCliWsl } : {})
       };
       safeWriteJsonSync(archivePathV1, v1Payload);
+
+      if (Object.keys(mergedCliLocal).length > 0 || Object.keys(savedCliWsl).length > 0) {
+        safeWriteJsonSync(cliSplitArchivePath, {
+          version: 1,
+          updatedAt: out.updatedAt,
+          cliLocal: mergedCliLocal,
+          cliWsl: savedCliWsl
+        });
+      }
     }
   } catch { }
+
+  if (useDiskCache && diskCacheDirty) {
+    try {
+      const cacheFiles = {};
+      for (const job of transcriptJobs) {
+        const cEntry = transcriptFileCache.get(job.path);
+        if (cEntry) {
+          cacheFiles[job.path] = {
+            size: cEntry.size,
+            mtimeMs: cEntry.mtimeMs,
+            minCreatedAt: cEntry.minCreatedAt || null,
+            records: cEntry.records || []
+          };
+        }
+      }
+      safeWriteJsonSync(transcriptCachePath, { version: 1, files: cacheFiles }, { indent: 0 });
+    } catch { }
+  }
 
   return {
     out,
@@ -5202,6 +5728,13 @@ module.exports = {
   collect,
   collectTokenHistory,
   collectTokenHistoryAsync,
+  findWslAntigravityCliDirs,
+  parseWslLxssRegistryOutput,
+  parseWslListOutput,
+  inferWslMetaFromPath,
+  mergeDailyMaps,
+  sumDailyMapTokens,
+  resetWslDiscoveryCacheForTest,
   scanFiles,
   pythonScan,
   resolvePython,

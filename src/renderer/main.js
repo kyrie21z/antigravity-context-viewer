@@ -1539,8 +1539,69 @@
     }
   }
 
+  function formatCompactTokenCount(v) {
+    const n = Number(v) || 0;
+    if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+    if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+    return String(n);
+  }
+
   // 数据源切换（全部 / 桌面 / CLI）
   let activeTokenSource = 'all';
+  let wslCliIncludedPref = undefined;
+  let wslCliToggleBusy = false;
+
+  function renderWslCliSourceBar() {
+    const bar = el('wsl-cli-source-bar');
+    if (!bar) return;
+    const cliSrc = ANTIGRAVITY_TOKEN_DATA.sources?.cli || null;
+    const wslDirs = Array.isArray(cliSrc?.wslDirs) ? cliSrc.wslDirs : [];
+    const enabled = wslCliIncludedPref !== undefined
+      ? wslCliIncludedPref
+      : (cliSrc ? cliSrc.wslEnabled !== false : true);
+    const shouldShow = Boolean(
+      cliSrc && (wslDirs.length > 0 || cliSrc.wslTranscriptsCount > 0 || (cliSrc.wslSupported && !enabled))
+    );
+    bar.style.display = shouldShow ? 'flex' : 'none';
+    if (!shouldShow) return;
+
+    const descEl = el('wsl-cli-source-desc');
+    const toggleBtn = el('btn-toggle-wsl-cli');
+    if (descEl) {
+      if (!enabled) {
+        descEl.textContent = t('tokens.wsl.disabledDesc');
+        descEl.title = descEl.textContent;
+      } else if (wslDirs.length > 0) {
+        const distroNames = Array.from(new Set(wslDirs.map(d => d.distro || 'WSL')));
+        const distrosText = distroNames.length > 2
+          ? `${distroNames.slice(0, 2).join(', ')} (+${distroNames.length - 2})`
+          : distroNames.join(', ');
+        const transcripts = Number(cliSrc.wslTranscriptsCount) || wslDirs.reduce((a, d) => a + (Number(d.transcriptsCount) || 0), 0);
+        const conversations = Number(cliSrc.wslConversationsCount) || wslDirs.reduce((a, d) => a + (Number(d.conversationsCount) || 0), 0);
+        const wslTokens = wslDirs.reduce((a, d) => a + (Number(d.tokens) || 0), 0);
+        descEl.textContent = wslTokens > 0
+          ? t('tokens.wsl.summaryWithTokens', { distros: distrosText, transcripts, tokens: formatCompactTokenCount(wslTokens) })
+          : t('tokens.wsl.summary', { distros: distrosText, transcripts, conversations });
+        descEl.title = wslDirs
+          .map(d => `${d.distro || 'WSL'}${d.user ? ` (${d.user})` : ''}: ${d.path} · ${d.transcriptsCount || 0} logs`)
+          .join('\n');
+      } else {
+        descEl.textContent = t('tokens.wsl.empty');
+        descEl.title = descEl.textContent;
+      }
+    }
+    if (toggleBtn) {
+      toggleBtn.disabled = wslCliToggleBusy;
+      toggleBtn.title = t('tokens.wsl.toggleTitle');
+      toggleBtn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+      setPillActive(toggleBtn, enabled);
+      toggleBtn.textContent = wslCliToggleBusy
+        ? t('tokens.wsl.loading')
+        : (enabled ? t('tokens.wsl.included') : t('tokens.wsl.excluded'));
+    }
+  }
+
   function switchTokenSource(src) {
     activeTokenSource = src;
     try { localStorage?.setItem('ag_token_source_v1', src); } catch { }
@@ -1556,11 +1617,34 @@
       ANTIGRAVITY_TOKEN_DATA.dailyMap = srcMap;
       renderActiveHeatView(true);
       renderActiveCostEstimateView();
+      renderWslCliSourceBar();
     }
   }
   el('src-tab-all')?.addEventListener('click', () => switchTokenSource('all'));
   el('src-tab-desktop')?.addEventListener('click', () => switchTokenSource('desktop'));
   el('src-tab-cli')?.addEventListener('click', () => switchTokenSource('cli'));
+  el('btn-toggle-wsl-cli')?.addEventListener('click', async () => {
+    if (wslCliToggleBusy) return;
+    const cliSrc = ANTIGRAVITY_TOKEN_DATA.sources?.cli || null;
+    const curEnabled = wslCliIncludedPref !== undefined
+      ? wslCliIncludedPref
+      : (cliSrc ? cliSrc.wslEnabled !== false : true);
+    const nextEnabled = !curEnabled;
+    wslCliToggleBusy = true;
+    wslCliIncludedPref = nextEnabled;
+    renderWslCliSourceBar();
+    try {
+      userActionSeq++;
+      await saveSettingsPayloadBridge({
+        includeWslCli: nextEnabled,
+        uiPreferences: { includeWslCli: nextEnabled }
+      });
+      await syncTokenHistoryFromHost(true);
+    } finally {
+      wslCliToggleBusy = false;
+      renderWslCliSourceBar();
+    }
+  });
 
   // 视图切换（Token 统计 / API 等值估算）
   let activeTokenView = 'tokens';
@@ -7887,7 +7971,12 @@
     // 更新小摘要来源与时间描述行及非实付常驻标识
     const scopeDescEl = el('cost-scope-desc');
     if (scopeDescEl) {
-      const srcName = activeTokenSource === 'desktop' ? t('tokens.srcDesktopLabel') : activeTokenSource === 'cli' ? 'CLI' : t('tokens.srcAllLabel');
+      const cliHasWsl = Boolean(ANTIGRAVITY_TOKEN_DATA.sources?.cli?.wslEnabled && (ANTIGRAVITY_TOKEN_DATA.sources?.cli?.wslDirs?.length > 0 || ANTIGRAVITY_TOKEN_DATA.sources?.cli?.wslTranscriptsCount > 0));
+      const srcName = activeTokenSource === 'desktop'
+        ? t('tokens.srcDesktopLabel')
+        : activeTokenSource === 'cli'
+          ? (cliHasWsl ? 'CLI (+WSL)' : 'CLI')
+          : t('tokens.srcAllLabel');
       const pLabel = isPeriod ? (ANTIGRAVITY_TOKEN_DATA.currentPeriod?.label || t('cost.periodTag')) : t('cost.allHistory');
       scopeDescEl.textContent = `${srcName} · ${pLabel}`;
     }
@@ -8502,6 +8591,16 @@
 
     ANTIGRAVITY_TOKEN_DATA.rawPayload = payload;
 
+    if (payload.sources && typeof payload.sources === 'object') {
+      ANTIGRAVITY_TOKEN_DATA.sources = payload.sources;
+      if (typeof payload.sources.cli?.wslEnabled === 'boolean' && wslCliIncludedPref === undefined) {
+        wslCliIncludedPref = payload.sources.cli.wslEnabled;
+      }
+    }
+    if (payload.uiPreferences && typeof payload.uiPreferences.includeWslCli === 'boolean') {
+      wslCliIncludedPref = payload.uiPreferences.includeWslCli;
+    }
+
     const core = typeof __AGContextMeterCore !== 'undefined' ? __AGContextMeterCore : null;
     const todayStr = formatLocalYmd(new Date());
     const normalized = core && typeof core.normalizeTokenHistoryPayload === 'function'
@@ -8634,13 +8733,7 @@
     const totalDays = sum.totalDays || Object.keys(ANTIGRAVITY_TOKEN_DATA.dailyMap).length;
     const avgMonth = Math.round(monthTokens / Math.max(1, totalDays));
 
-    const fmtCardM = v => {
-      const n = Number(v) || 0;
-      if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
-      if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
-      if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
-      return String(n);
-    };
+    const fmtCardM = formatCompactTokenCount;
     const badgeAmt = el('token-amount');
     const badgeExtra = el('token-hover-extra');
     const overAmt = el('overflow-tokens-val');
@@ -8706,6 +8799,7 @@
 
     // 规范化已完整保留输入/缓存/输出分类，执行费用视图渲染
     renderActiveCostEstimateView();
+    renderWslCliSourceBar();
 
     computeTimelineWindow();
     renderActiveHeatView(true);
@@ -8823,6 +8917,10 @@
         const savedLang = settingsRes.panelLanguage || settingsRes.uiPreferences?.panelLanguage;
         if (savedLang && ['zh-CN', 'zh-TW', 'en'].includes(savedLang) && savedLang !== currentPanelLanguage) {
           await applyPanelLanguage(savedLang, { persist: false });
+        }
+        if (typeof settingsRes.uiPreferences?.includeWslCli === 'boolean') {
+          wslCliIncludedPref = settingsRes.uiPreferences.includeWslCli;
+          renderWslCliSourceBar();
         }
       } else {
         try {

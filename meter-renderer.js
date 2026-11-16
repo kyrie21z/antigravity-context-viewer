@@ -679,6 +679,26 @@
       background:var(--ag-unified-bg);color:var(--ag-text-primary);font-weight:600;
       box-shadow:0 1px 3px rgba(0,0,0,0.18);
     }
+    .wsl-source-bar{
+      display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;
+      margin:0 0 6px;padding:4px 8px;border-radius:6px;
+      background:var(--ag-bg-subcard);border:1px solid var(--ag-border-subcard);
+      font-size:10.5px;line-height:1.35;
+    }
+    .wsl-source-info{
+      display:flex;align-items:center;gap:6px;min-width:0;flex:1;overflow:hidden;
+    }
+    .wsl-source-badge{
+      display:inline-flex;align-items:center;flex-shrink:0;
+      padding:1px 5px;border-radius:4px;font-size:9.5px;font-weight:600;
+      background:rgba(16,185,129,0.14);color:#10b981;border:1px solid rgba(16,185,129,0.28);
+    }
+    .wsl-source-desc{
+      color:var(--ag-text-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+    }
+    .wsl-toggle-btn{
+      flex-shrink:0;padding:1px 7px;font-size:10px;
+    }
     .plan-summary-price-badge{
       display:inline-flex;align-items:center;gap:4px;
       padding:2px 9px;border-radius:999px;
@@ -3044,6 +3064,15 @@
       </div>
     </div>
 
+    <div id="wsl-cli-source-bar" class="wsl-source-bar" style="display:none">
+      <div class="wsl-source-info">
+        <span class="wsl-source-badge">WSL CLI</span>
+        <span id="wsl-cli-source-desc" class="wsl-source-desc">—</span>
+      </div>
+      <button id="btn-toggle-wsl-cli" class="switch-pill-btn wsl-toggle-btn active" type="button"
+        aria-pressed="true" data-i18n="tokens.wsl.included">已纳入 ✓</button>
+    </div>
+
     <!-- 账号套餐状态摘要行 -->
     <div id="plan-summary-bar" class="plan-summary-bar">
       <div class="plan-summary-badge" style="display:flex;align-items:center;gap:6px;flex:1;overflow:hidden">
@@ -4331,6 +4360,14 @@ const PANEL_I18N = {
   'tokens.src.all': { 'zh-CN': '全部', 'zh-TW': '全部', en: 'All' },
   'tokens.src.desktop': { 'zh-CN': '桌面端', 'zh-TW': '桌面端', en: 'Desktop' },
   'tokens.src.cli': { 'zh-CN': 'CLI', 'zh-TW': 'CLI', en: 'CLI' },
+  'tokens.wsl.included': { 'zh-CN': '已纳入 ✓', 'zh-TW': '已納入 ✓', en: 'Included ✓' },
+  'tokens.wsl.excluded': { 'zh-CN': '已停用', 'zh-TW': '已停用', en: 'Excluded' },
+  'tokens.wsl.loading': { 'zh-CN': '刷新中…', 'zh-TW': '重新整理中…', en: 'Updating…' },
+  'tokens.wsl.summaryWithTokens': { 'zh-CN': '{distros} · {transcripts} 日志 · {tokens}', 'zh-TW': '{distros} · {transcripts} 日誌 · {tokens}', en: '{distros} · {transcripts} logs · {tokens}' },
+  'tokens.wsl.summary': { 'zh-CN': '{distros} · {transcripts} 日志 / {conversations} 会话', 'zh-TW': '{distros} · {transcripts} 日誌 / {conversations} 對話', en: '{distros} · {transcripts} logs / {conversations} sessions' },
+  'tokens.wsl.empty': { 'zh-CN': '未检测到 WSL CLI 会话数据', 'zh-TW': '未偵測到 WSL CLI 對話資料', en: 'No WSL CLI session logs detected' },
+  'tokens.wsl.disabledDesc': { 'zh-CN': 'WSL CLI 数据未计入当前统计（点击右侧开启）', 'zh-TW': 'WSL CLI 資料未計入目前統計（點擊右側開啟）', en: 'WSL CLI stats excluded (click to include)' },
+  'tokens.wsl.toggleTitle': { 'zh-CN': '切换是否将 WSL 中的 Antigravity CLI 用量计入统计', 'zh-TW': '切換是否將 WSL 中的 Antigravity CLI 用量計入統計', en: 'Toggle including WSL Antigravity CLI usage in stats' },
   'tokens.view.tokens': { 'zh-CN': 'Token 统计', 'zh-TW': 'Token 統計', en: 'Token Stats' },
   'tokens.view.cost': { 'zh-CN': 'API 参考金额', 'zh-TW': 'API 參考金額', en: 'API Est. Cost' },
   'tokens.card.total': { 'zh-CN': '累计处理 Token', 'zh-TW': '累計處理 Token', en: 'Total Tokens' },
@@ -11323,8 +11360,69 @@ function closeAllDropdowns(exceptWrap = null) {
     }
   }
 
+  function formatCompactTokenCount(v) {
+    const n = Number(v) || 0;
+    if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+    if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+    return String(n);
+  }
+
   // 数据源切换（全部 / 桌面 / CLI）
   let activeTokenSource = 'all';
+  let wslCliIncludedPref = undefined;
+  let wslCliToggleBusy = false;
+
+  function renderWslCliSourceBar() {
+    const bar = el('wsl-cli-source-bar');
+    if (!bar) return;
+    const cliSrc = ANTIGRAVITY_TOKEN_DATA.sources?.cli || null;
+    const wslDirs = Array.isArray(cliSrc?.wslDirs) ? cliSrc.wslDirs : [];
+    const enabled = wslCliIncludedPref !== undefined
+      ? wslCliIncludedPref
+      : (cliSrc ? cliSrc.wslEnabled !== false : true);
+    const shouldShow = Boolean(
+      cliSrc && (wslDirs.length > 0 || cliSrc.wslTranscriptsCount > 0 || (cliSrc.wslSupported && !enabled))
+    );
+    bar.style.display = shouldShow ? 'flex' : 'none';
+    if (!shouldShow) return;
+
+    const descEl = el('wsl-cli-source-desc');
+    const toggleBtn = el('btn-toggle-wsl-cli');
+    if (descEl) {
+      if (!enabled) {
+        descEl.textContent = t('tokens.wsl.disabledDesc');
+        descEl.title = descEl.textContent;
+      } else if (wslDirs.length > 0) {
+        const distroNames = Array.from(new Set(wslDirs.map(d => d.distro || 'WSL')));
+        const distrosText = distroNames.length > 2
+          ? `${distroNames.slice(0, 2).join(', ')} (+${distroNames.length - 2})`
+          : distroNames.join(', ');
+        const transcripts = Number(cliSrc.wslTranscriptsCount) || wslDirs.reduce((a, d) => a + (Number(d.transcriptsCount) || 0), 0);
+        const conversations = Number(cliSrc.wslConversationsCount) || wslDirs.reduce((a, d) => a + (Number(d.conversationsCount) || 0), 0);
+        const wslTokens = wslDirs.reduce((a, d) => a + (Number(d.tokens) || 0), 0);
+        descEl.textContent = wslTokens > 0
+          ? t('tokens.wsl.summaryWithTokens', { distros: distrosText, transcripts, tokens: formatCompactTokenCount(wslTokens) })
+          : t('tokens.wsl.summary', { distros: distrosText, transcripts, conversations });
+        descEl.title = wslDirs
+          .map(d => `${d.distro || 'WSL'}${d.user ? ` (${d.user})` : ''}: ${d.path} · ${d.transcriptsCount || 0} logs`)
+          .join('\n');
+      } else {
+        descEl.textContent = t('tokens.wsl.empty');
+        descEl.title = descEl.textContent;
+      }
+    }
+    if (toggleBtn) {
+      toggleBtn.disabled = wslCliToggleBusy;
+      toggleBtn.title = t('tokens.wsl.toggleTitle');
+      toggleBtn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+      setPillActive(toggleBtn, enabled);
+      toggleBtn.textContent = wslCliToggleBusy
+        ? t('tokens.wsl.loading')
+        : (enabled ? t('tokens.wsl.included') : t('tokens.wsl.excluded'));
+    }
+  }
+
   function switchTokenSource(src) {
     activeTokenSource = src;
     try { localStorage?.setItem('ag_token_source_v1', src); } catch { }
@@ -11340,11 +11438,34 @@ function closeAllDropdowns(exceptWrap = null) {
       ANTIGRAVITY_TOKEN_DATA.dailyMap = srcMap;
       renderActiveHeatView(true);
       renderActiveCostEstimateView();
+      renderWslCliSourceBar();
     }
   }
   el('src-tab-all')?.addEventListener('click', () => switchTokenSource('all'));
   el('src-tab-desktop')?.addEventListener('click', () => switchTokenSource('desktop'));
   el('src-tab-cli')?.addEventListener('click', () => switchTokenSource('cli'));
+  el('btn-toggle-wsl-cli')?.addEventListener('click', async () => {
+    if (wslCliToggleBusy) return;
+    const cliSrc = ANTIGRAVITY_TOKEN_DATA.sources?.cli || null;
+    const curEnabled = wslCliIncludedPref !== undefined
+      ? wslCliIncludedPref
+      : (cliSrc ? cliSrc.wslEnabled !== false : true);
+    const nextEnabled = !curEnabled;
+    wslCliToggleBusy = true;
+    wslCliIncludedPref = nextEnabled;
+    renderWslCliSourceBar();
+    try {
+      userActionSeq++;
+      await saveSettingsPayloadBridge({
+        includeWslCli: nextEnabled,
+        uiPreferences: { includeWslCli: nextEnabled }
+      });
+      await syncTokenHistoryFromHost(true);
+    } finally {
+      wslCliToggleBusy = false;
+      renderWslCliSourceBar();
+    }
+  });
 
   // 视图切换（Token 统计 / API 等值估算）
   let activeTokenView = 'tokens';
@@ -17671,7 +17792,12 @@ function closeAllDropdowns(exceptWrap = null) {
     // 更新小摘要来源与时间描述行及非实付常驻标识
     const scopeDescEl = el('cost-scope-desc');
     if (scopeDescEl) {
-      const srcName = activeTokenSource === 'desktop' ? t('tokens.srcDesktopLabel') : activeTokenSource === 'cli' ? 'CLI' : t('tokens.srcAllLabel');
+      const cliHasWsl = Boolean(ANTIGRAVITY_TOKEN_DATA.sources?.cli?.wslEnabled && (ANTIGRAVITY_TOKEN_DATA.sources?.cli?.wslDirs?.length > 0 || ANTIGRAVITY_TOKEN_DATA.sources?.cli?.wslTranscriptsCount > 0));
+      const srcName = activeTokenSource === 'desktop'
+        ? t('tokens.srcDesktopLabel')
+        : activeTokenSource === 'cli'
+          ? (cliHasWsl ? 'CLI (+WSL)' : 'CLI')
+          : t('tokens.srcAllLabel');
       const pLabel = isPeriod ? (ANTIGRAVITY_TOKEN_DATA.currentPeriod?.label || t('cost.periodTag')) : t('cost.allHistory');
       scopeDescEl.textContent = `${srcName} · ${pLabel}`;
     }
@@ -18286,6 +18412,16 @@ function closeAllDropdowns(exceptWrap = null) {
 
     ANTIGRAVITY_TOKEN_DATA.rawPayload = payload;
 
+    if (payload.sources && typeof payload.sources === 'object') {
+      ANTIGRAVITY_TOKEN_DATA.sources = payload.sources;
+      if (typeof payload.sources.cli?.wslEnabled === 'boolean' && wslCliIncludedPref === undefined) {
+        wslCliIncludedPref = payload.sources.cli.wslEnabled;
+      }
+    }
+    if (payload.uiPreferences && typeof payload.uiPreferences.includeWslCli === 'boolean') {
+      wslCliIncludedPref = payload.uiPreferences.includeWslCli;
+    }
+
     const core = typeof __AGContextMeterCore !== 'undefined' ? __AGContextMeterCore : null;
     const todayStr = formatLocalYmd(new Date());
     const normalized = core && typeof core.normalizeTokenHistoryPayload === 'function'
@@ -18418,13 +18554,7 @@ function closeAllDropdowns(exceptWrap = null) {
     const totalDays = sum.totalDays || Object.keys(ANTIGRAVITY_TOKEN_DATA.dailyMap).length;
     const avgMonth = Math.round(monthTokens / Math.max(1, totalDays));
 
-    const fmtCardM = v => {
-      const n = Number(v) || 0;
-      if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
-      if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
-      if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
-      return String(n);
-    };
+    const fmtCardM = formatCompactTokenCount;
     const badgeAmt = el('token-amount');
     const badgeExtra = el('token-hover-extra');
     const overAmt = el('overflow-tokens-val');
@@ -18490,6 +18620,7 @@ function closeAllDropdowns(exceptWrap = null) {
 
     // 规范化已完整保留输入/缓存/输出分类，执行费用视图渲染
     renderActiveCostEstimateView();
+    renderWslCliSourceBar();
 
     computeTimelineWindow();
     renderActiveHeatView(true);
@@ -18607,6 +18738,10 @@ function closeAllDropdowns(exceptWrap = null) {
         const savedLang = settingsRes.panelLanguage || settingsRes.uiPreferences?.panelLanguage;
         if (savedLang && ['zh-CN', 'zh-TW', 'en'].includes(savedLang) && savedLang !== currentPanelLanguage) {
           await applyPanelLanguage(savedLang, { persist: false });
+        }
+        if (typeof settingsRes.uiPreferences?.includeWslCli === 'boolean') {
+          wslCliIncludedPref = settingsRes.uiPreferences.includeWslCli;
+          renderWslCliSourceBar();
         }
       } else {
         try {

@@ -4652,3 +4652,112 @@ test('Issue #22: applyAppUpdate 在严格模式下不因未声明 currentVer 报
     api.dispose();
   }
 });
+
+test('WSL CLI source bar: displays WSL distro stats, toggles persistence + refresh, and translates across languages', async () => {
+  const savedPayloads = [];
+  let historyCalls = 0;
+  let currentWslEnabled = true;
+
+  const h = harness();
+  const api = h.sandbox.__AGContextMeter;
+  try {
+    h.sandbox.window.contextMeterAPI = {
+      ...h.sandbox.window.contextMeterAPI,
+      saveSettings: async (payload) => {
+        savedPayloads.push(payload);
+        if (typeof payload?.uiPreferences?.includeWslCli === 'boolean') {
+          currentWslEnabled = payload.uiPreferences.includeWslCli;
+        }
+        return { ok: true, uiPreferences: { includeWslCli: currentWslEnabled } };
+      },
+      getTokenHistory: async (force) => {
+        historyCalls++;
+        assert.equal(force, true);
+        return {
+          ok: true,
+          data: {
+            schemaVersion: '0.8.5',
+            version: '0.8.5',
+            summary: {
+              grandTotalTokens: currentWslEnabled ? 2930705849 : 0,
+              todayTokens: 0,
+              monthTokens: 0,
+              yearTokens: 0,
+              totalConversations: currentWslEnabled ? 401 : 0
+            },
+            sources: {
+              desktop: { conversationsCount: 0, transcriptsCount: 0 },
+              cli: {
+                wslSupported: true,
+                wslEnabled: currentWslEnabled,
+                wslTranscriptsCount: currentWslEnabled ? 262 : 0,
+                wslConversationsCount: currentWslEnabled ? 401 : 0,
+                wslDirs: currentWslEnabled
+                  ? [{ distro: 'Ubuntu-26.04', user: 'devuser', path: '\\\\wsl.localhost\\Ubuntu-26.04\\home\\devuser\\.gemini\\antigravity-cli', conversationsCount: 401, transcriptsCount: 262, tokens: 2930705849 }]
+                  : []
+              }
+            },
+            dailyMap: currentWslEnabled ? { '2026-11-15': { total: 2930705849, input: 150000000, cache: 2760000000, output: 20705849, steps: 25000 } } : {},
+            dailyMapBySource: {
+              all: currentWslEnabled ? { '2026-11-15': { total: 2930705849, input: 150000000, cache: 2760000000, output: 20705849, steps: 25000 } } : {},
+              desktop: {},
+              cli: currentWslEnabled ? { '2026-11-15': { total: 2930705849, input: 150000000, cache: 2760000000, output: 20705849, steps: 25000 } } : {}
+            }
+          }
+        };
+      }
+    };
+
+    api.applyTokenHistoryPayload({
+      schemaVersion: '0.8.5',
+      summary: { grandTotalTokens: 2930705849, totalConversations: 401 },
+      sources: {
+        desktop: { conversationsCount: 0, transcriptsCount: 0 },
+        cli: {
+          wslSupported: true,
+          wslEnabled: true,
+          wslTranscriptsCount: 262,
+          wslConversationsCount: 401,
+          wslDirs: [{ distro: 'Ubuntu-26.04', user: 'devuser', path: '\\\\wsl.localhost\\Ubuntu-26.04\\home\\devuser\\.gemini\\antigravity-cli', conversationsCount: 401, transcriptsCount: 262, tokens: 2930705849 }]
+        }
+      },
+      dailyMap: { '2026-11-15': { total: 2930705849, input: 150000000, cache: 2760000000, output: 20705849, steps: 25000 } },
+      dailyMapBySource: {
+        all: { '2026-11-15': { total: 2930705849, input: 150000000, cache: 2760000000, output: 20705849, steps: 25000 } },
+        desktop: {},
+        cli: { '2026-11-15': { total: 2930705849, input: 150000000, cache: 2760000000, output: 20705849, steps: 25000 } }
+      }
+    });
+
+    const wslBar = h.elements.get('wsl-cli-source-bar');
+    const wslDesc = h.elements.get('wsl-cli-source-desc');
+    const toggleBtn = h.elements.get('btn-toggle-wsl-cli');
+    assert.equal(wslBar.style.display, 'flex');
+    assert.match(wslDesc.textContent, /Ubuntu-26\.04/);
+    assert.match(wslDesc.textContent, /262/);
+    assert.match(wslDesc.textContent, /2\.93B/);
+    assert.equal(toggleBtn.textContent, '已纳入 ✓');
+
+    // Switch to CLI tab and verify cost scope description indicates WSL
+    h.elements.get('src-tab-cli').click();
+    assert.match(h.elements.get('cost-scope-desc').textContent, /CLI \(\+WSL\)/);
+
+    // Toggle WSL OFF
+    toggleBtn.click();
+    await h.flush();
+    assert.equal(savedPayloads.length, 1);
+    assert.equal(savedPayloads[0].uiPreferences.includeWslCli, false);
+    assert.equal(historyCalls, 1);
+    assert.equal(wslBar.style.display, 'flex');
+    assert.equal(toggleBtn.textContent, '已停用');
+    assert.match(wslDesc.textContent, /未计入/);
+
+    // Switch to English and check translations
+    h.elements.get('btn-top-lang-en').click();
+    await h.flush();
+    assert.equal(toggleBtn.textContent, 'Excluded');
+    assert.match(wslDesc.textContent, /excluded/i);
+  } finally {
+    api.dispose();
+  }
+});
