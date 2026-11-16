@@ -3788,9 +3788,91 @@ test('WSL CLI integration: aggregates WSL CLI tokens with desktop & local CLI, p
     assert.equal(sumDailyMapTokens(resReOn.dailyMapBySource.cli), 36800);
     assert.equal(resReOn.summary.grandTotalTokens, 38400);
     assert.equal(resReOn.costEstimateBySource.cli.pricedRequestsCount, 2);
+
+    // 4. Verify per-model daily breakdown reconciles cleanly across desktop + local CLI + WSL CLI
+    const dayModelsAll = resReOn.dailyModelMapBySource.all['2026-11-15'];
+    assert.ok(dayModelsAll);
+    const modelSum = Object.values(dayModelsAll).reduce((a, b) => a + (b.total || 0), 0);
+    assert.equal(modelSum, 38400);
+    assert.equal(dayModelsAll['gemini-4-hydrogen:medium'].total, 35300); // 1600 + 3200 + 30500
+    assert.equal(dayModelsAll[require('./meter-core').UNATTRIBUTED_MODEL_KEY].total, 3100);
   } finally {
     fs.rmSync(agDir, { recursive: true, force: true });
     fs.rmSync(localCliDir, { recursive: true, force: true });
     fs.rmSync(wslDistroRoot, { recursive: true, force: true });
   }
+});
+
+test('Model usage breakdown: unifies desktop & CLI model variants and summarizes 7d/30d windows accurately', () => {
+  const {
+    resolveModelUsageBucket,
+    summarizeModelUsageWindow,
+    UNATTRIBUTED_MODEL_KEY
+  } = require('./meter-core');
+
+  const deskBucket = resolveModelUsageBucket({
+    model: 'Gemini 4 Hydrogen (Medium)',
+    modelExactId: 'MODEL_PLACEHOLDER_M526'
+  });
+  const cliBucket = resolveModelUsageBucket({
+    model: 'gemini-4-hydrogen-medium'
+  });
+  assert.equal(deskBucket.modelKey, 'gemini-4-hydrogen');
+  assert.equal(cliBucket.modelKey, 'gemini-4-hydrogen');
+  assert.equal(deskBucket.variantKey, 'gemini-4-hydrogen:medium');
+  assert.equal(cliBucket.variantKey, 'gemini-4-hydrogen:medium');
+  assert.equal(deskBucket.variantLabel, 'Gemini 4 Hydrogen (Medium)');
+  assert.equal(cliBucket.variantLabel, 'Gemini 4 Hydrogen (Medium)');
+
+  const unattr = resolveModelUsageBucket({ model: '' });
+  assert.equal(unattr.modelKey, UNATTRIBUTED_MODEL_KEY);
+  assert.equal(unattr.isAttributed, false);
+
+  const sampleMap = {
+    '2026-11-14': {
+      'gemini-4-hydrogen:medium': { total: 800, input: 100, cache: 600, output: 100, steps: 2 },
+      'gemini-4-argon:high': { total: 200, input: 50, cache: 100, output: 50, steps: 1 }
+    },
+    '2026-11-15': {
+      'gemini-4-hydrogen:xhigh': { total: 500, input: 100, cache: 300, output: 100, steps: 1 },
+      [UNATTRIBUTED_MODEL_KEY]: { total: 500, input: 50, cache: 400, output: 50, steps: 2 }
+    }
+  };
+  const meta = {
+    'gemini-4-hydrogen:medium': { modelKey: 'gemini-4-hydrogen', modelLabel: 'Gemini 4 Hydrogen', variantKey: 'gemini-4-hydrogen:medium', variantLabel: 'Gemini 4 Hydrogen (Medium)' },
+    'gemini-4-hydrogen:xhigh': { modelKey: 'gemini-4-hydrogen', modelLabel: 'Gemini 4 Hydrogen', variantKey: 'gemini-4-hydrogen:xhigh', variantLabel: 'Gemini 4 Hydrogen (XHigh)' },
+    'gemini-4-argon:high': { modelKey: 'gemini-4-argon', modelLabel: 'Gemini 4 Argon', variantKey: 'gemini-4-argon:high', variantLabel: 'Gemini 4 Argon (High)' }
+  };
+
+  const winModel = summarizeModelUsageWindow(sampleMap, {
+    periodDays: 7,
+    endDate: '2026-11-16',
+    groupBy: 'model',
+    metric: 'total',
+    modelMetaByKey: meta
+  });
+  assert.equal(winModel.days.length, 7);
+  assert.equal(winModel.windowTotalTokens, 2000);
+  assert.equal(winModel.hasUnattributed, true);
+  assert.equal(winModel.legend[0].key, 'gemini-4-hydrogen');
+  assert.equal(winModel.legend[0].tokens, 1300);
+  assert.equal(winModel.legend[0].pctLabel, '65%');
+  assert.equal(winModel.legend[1].key, 'gemini-4-argon');
+  assert.equal(winModel.legend[1].pctLabel, '10%');
+  assert.equal(winModel.legend[2].key, UNATTRIBUTED_MODEL_KEY);
+  assert.equal(winModel.legend[2].pctLabel, '25%');
+
+  const winNoCacheVar = summarizeModelUsageWindow(sampleMap, {
+    periodDays: 30,
+    endDate: '2026-11-16',
+    groupBy: 'variant',
+    metric: 'noCache',
+    hideUnattributed: true,
+    modelMetaByKey: meta
+  });
+  assert.equal(winNoCacheVar.days.length, 30);
+  assert.equal(winNoCacheVar.windowTotalTokens, 500); // (100+100) + (50+50) + (100+100)
+  assert.equal(winNoCacheVar.legend.length, 3);
+  assert.equal(winNoCacheVar.legend[0].label, 'Gemini 4 Hydrogen (Medium)');
+  assert.equal(winNoCacheVar.legend[0].pctLabel, '40%');
 });

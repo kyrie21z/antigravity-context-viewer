@@ -60,6 +60,8 @@ const {
   extractModelString,
   normalizeModelId,
   resolveStableModelId,
+  UNATTRIBUTED_MODEL_KEY,
+  resolveModelUsageBucket,
   isValidSpeedSample,
   MAX_SPEED_SAMPLES_PER_MODEL,
   calculateRequestApiCost,
@@ -3070,6 +3072,204 @@ async function runHistoryWorkerTask(payload, cmd = 'collectTokenHistory', taskOp
   }
 }
 
+function mergeModelDailyMaps(...maps) {
+  const out = {};
+  for (const m of maps) {
+    if (!m || typeof m !== 'object') continue;
+    for (const [dateKey, dayObj] of Object.entries(m)) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey) || !dayObj || typeof dayObj !== 'object') continue;
+      if (!out[dateKey]) out[dateKey] = {};
+      for (const [mKey, rec] of Object.entries(dayObj)) {
+        if (!rec || typeof rec !== 'object') continue;
+        if (!out[dateKey][mKey]) {
+          out[dateKey][mKey] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+        }
+        out[dateKey][mKey].total += Number(rec.total) || 0;
+        out[dateKey][mKey].input += Number(rec.input) || 0;
+        out[dateKey][mKey].output += Number(rec.output) || 0;
+        out[dateKey][mKey].cache += Number(rec.cache) || 0;
+        out[dateKey][mKey].steps += Number(rec.steps) || 0;
+      }
+    }
+  }
+  return out;
+}
+
+function buildDailyModelBreakdown(params) {
+  const {
+    recentRequests,
+    visibleCallsEntries,
+    matchedTranscriptReqs,
+    matchedLedgerKeys,
+    resolveLedgerCallDate,
+    mergedDesktop,
+    mergedCliLocal,
+    effectiveCliWsl,
+    savedCliWsl,
+    mergedLegacyUnallocated,
+    archiveV2,
+    compactModelConfigs,
+    wslEnabled
+  } = params;
+
+  const modelMetaByKey = { ...(archiveV2?.modelMetaByKey || {}) };
+  const matchedModels = { desktop: {}, cliLocal: {}, cliWsl: {} };
+  const extraModels = { desktop: {}, cliLocal: {}, cliWsl: {} };
+
+  const addModelBucket = (srcMap, dateKey, callObj, inp, cap, outp, tot, steps = 1) => {
+    if (!dateKey || !/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return;
+    if (tot <= 0 && steps <= 0) return;
+    const bucket = resolveModelUsageBucket(callObj, compactModelConfigs);
+    const vKey = bucket.variantKey || UNATTRIBUTED_MODEL_KEY;
+    if (bucket.isAttributed && vKey !== UNATTRIBUTED_MODEL_KEY) {
+      modelMetaByKey[vKey] = {
+        modelKey: bucket.modelKey,
+        modelLabel: bucket.modelLabel,
+        variantKey: vKey,
+        variantLabel: bucket.variantLabel
+      };
+    }
+    if (!srcMap[dateKey]) srcMap[dateKey] = {};
+    if (!srcMap[dateKey][vKey]) {
+      srcMap[dateKey][vKey] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+    }
+    srcMap[dateKey][vKey].total += tot;
+    srcMap[dateKey][vKey].input += inp;
+    srcMap[dateKey][vKey].output += outp;
+    srcMap[dateKey][vKey].cache += cap;
+    srcMap[dateKey][vKey].steps += steps;
+  };
+
+  // 1. 先处理已入账调用（包含被 RPC 模型富化后的桌面端与 CLI 匹配调用，以及仅存于账本的历史调用）
+  for (const [ledgerKey, c] of visibleCallsEntries) {
+    if (!c) continue;
+    const effDate = resolveLedgerCallDate(ledgerKey, c);
+    if (!effDate || !/^\d{4}-\d{2}-\d{2}$/.test(effDate)) continue;
+    const srcKey = c.source === 'cli' ? (c.cliOrigin === 'wsl' ? 'cliWsl' : 'cliLocal') : 'desktop';
+    const inp = Number(c.inputTokens ?? c.input_tokens ?? c.input ?? 0) || 0;
+    const cap = Number(c.cacheTokens ?? c.cacheReadTokens ?? c.cache_read_tokens ?? c.cached ?? 0) || 0;
+    const outp = Number(c.outputTokens ?? c.output_tokens ?? c.output ?? 0) || 0;
+    const tot = Number(c.totalTokens) || (inp + cap + outp);
+    if (matchedLedgerKeys.has(ledgerKey)) {
+      addModelBucket(matchedModels[srcKey], effDate, c, inp, cap, outp, tot, 1);
+    } else {
+      addModelBucket(extraModels[srcKey], effDate, c, inp, cap, outp, tot, 1);
+    }
+  }
+
+  // 2. 再处理未匹配账本的实时 transcript 调用（例如无 model 或未入账模型的历史步骤）
+  for (const r of recentRequests) {
+    if (matchedTranscriptReqs && matchedTranscriptReqs.has(r)) continue;
+    const srcKey = r.source === 'cli' ? (r.cliOrigin === 'wsl' ? 'cliWsl' : 'cliLocal') : 'desktop';
+    const inp = Number(r.inputTokens) || 0;
+    const cap = Number(r.cacheTokens ?? r.cacheReadTokens ?? 0) || 0;
+    const outp = Number(r.outputTokens) || 0;
+    const tot = Number(r.totalTokens) || (inp + cap + outp);
+    addModelBucket(matchedModels[srcKey], r.date, r, inp, cap, outp, tot, 1);
+  }
+
+  const reconcileSourceMap = (srcKey, authDailyMap) => {
+    const archivedModels = archiveV2?.dailyModelMapBySource?.[srcKey] || {};
+    const outMap = {};
+    const allDates = new Set([
+      ...Object.keys(authDailyMap || {}),
+      ...Object.keys(matchedModels[srcKey]),
+      ...Object.keys(extraModels[srcKey])
+    ]);
+    for (const dateKey of allDates) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) continue;
+      const authRec = authDailyMap?.[dateKey];
+      if (!authRec || Number(authRec.total) <= 0) continue;
+
+      const dayOut = {};
+      const scanDay = matchedModels[srcKey][dateKey];
+      const extraDay = extraModels[srcKey][dateKey];
+      let sumTot = 0, sumInp = 0, sumOut = 0, sumCap = 0, sumSteps = 0;
+
+      if (scanDay || extraDay) {
+        if (scanDay) {
+          for (const [mKey, rec] of Object.entries(scanDay)) {
+            if (sumTot >= authRec.total) break;
+            const takeTot = Math.min(rec.total, authRec.total - sumTot);
+            const ratio = rec.total > 0 ? takeTot / rec.total : 0;
+            const addInp = takeTot === rec.total ? rec.input : Math.round(rec.input * ratio);
+            const addOut = takeTot === rec.total ? rec.output : Math.round(rec.output * ratio);
+            const addCap = takeTot === rec.total ? rec.cache : Math.max(0, takeTot - addInp - addOut);
+            dayOut[mKey] = { total: takeTot, input: addInp, output: addOut, cache: addCap, steps: rec.steps };
+            sumTot += takeTot; sumInp += addInp; sumOut += addOut; sumCap += addCap; sumSteps += rec.steps;
+          }
+        }
+        if (extraDay) {
+          for (const [mKey, rec] of Object.entries(extraDay)) {
+            if (sumTot >= authRec.total) break;
+            const takeTot = Math.min(rec.total, authRec.total - sumTot);
+            const ratio = rec.total > 0 ? takeTot / rec.total : 0;
+            if (!dayOut[mKey]) dayOut[mKey] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+            const addInp = takeTot === rec.total ? rec.input : Math.round(rec.input * ratio);
+            const addOut = takeTot === rec.total ? rec.output : Math.round(rec.output * ratio);
+            const addCap = takeTot === rec.total ? rec.cache : Math.max(0, takeTot - addInp - addOut);
+            dayOut[mKey].total += takeTot;
+            dayOut[mKey].input += addInp;
+            dayOut[mKey].output += addOut;
+            dayOut[mKey].cache += addCap;
+            dayOut[mKey].steps += rec.steps;
+            sumTot += takeTot; sumInp += addInp; sumOut += addOut; sumCap += addCap; sumSteps += rec.steps;
+          }
+        }
+      } else if (archivedModels[dateKey]) {
+        for (const [mKey, rec] of Object.entries(archivedModels[dateKey])) {
+          dayOut[mKey] = { ...rec };
+          sumTot += rec.total; sumInp += rec.input; sumOut += rec.output; sumCap += rec.cache; sumSteps += rec.steps;
+        }
+      }
+
+      const diffTot = Math.max(0, (Number(authRec.total) || 0) - sumTot);
+      if (diffTot > 0) {
+        if (!dayOut[UNATTRIBUTED_MODEL_KEY]) {
+          dayOut[UNATTRIBUTED_MODEL_KEY] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+        }
+        dayOut[UNATTRIBUTED_MODEL_KEY].total += diffTot;
+        dayOut[UNATTRIBUTED_MODEL_KEY].input += Math.max(0, (Number(authRec.input) || 0) - sumInp);
+        dayOut[UNATTRIBUTED_MODEL_KEY].output += Math.max(0, (Number(authRec.output) || 0) - sumOut);
+        dayOut[UNATTRIBUTED_MODEL_KEY].cache += Math.max(0, (Number(authRec.cache) || 0) - sumCap);
+        dayOut[UNATTRIBUTED_MODEL_KEY].steps += Math.max(0, (Number(authRec.steps) || 0) - sumSteps);
+      }
+
+      if (Object.keys(dayOut).length > 0) outMap[dateKey] = dayOut;
+    }
+    return outMap;
+  };
+
+  const desktopModelMap = reconcileSourceMap('desktop', mergedDesktop);
+  const cliLocalModelMap = reconcileSourceMap('cliLocal', mergedCliLocal);
+  const savedCliWslModelMap = reconcileSourceMap('cliWsl', savedCliWsl);
+  const effectiveCliWslModelMap = wslEnabled ? savedCliWslModelMap : {};
+  const cliModelMap = mergeModelDailyMaps(cliLocalModelMap, effectiveCliWslModelMap);
+
+  const unallocatedModelMap = {};
+  for (const [dateKey, rec] of Object.entries(mergedLegacyUnallocated || {})) {
+    if (!rec || Number(rec.total) <= 0) continue;
+    unallocatedModelMap[dateKey] = { [UNATTRIBUTED_MODEL_KEY]: { ...rec } };
+  }
+  const allModelMap = mergeModelDailyMaps(desktopModelMap, cliModelMap, unallocatedModelMap);
+
+  return {
+    dailyModelMapBySource: {
+      all: allModelMap,
+      desktop: desktopModelMap,
+      cli: cliModelMap,
+      cliLocal: cliLocalModelMap,
+      cliWsl: effectiveCliWslModelMap
+    },
+    savedDailyModelBySource: {
+      desktop: desktopModelMap,
+      cliLocal: cliLocalModelMap,
+      cliWsl: savedCliWslModelMap
+    },
+    modelMetaByKey
+  };
+}
+
 /**
  * 历史用量与账本聚合核心逻辑（支持在 Worker 线程或主线程直接运行）
  * @param {object} options
@@ -4112,6 +4312,21 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
   const wslDirsMeta = Array.from(wslStatsByPath.values());
   const localCliTranscriptsCount = transcriptJobs.filter(j => j.source === 'cli' && j.subSource !== 'cli_wsl').length;
   const wslCliTranscriptsCount = transcriptJobs.filter(j => j.source === 'cli' && j.subSource === 'cli_wsl').length;
+  const modelBreakdown = buildDailyModelBreakdown({
+    recentRequests,
+    visibleCallsEntries,
+    matchedTranscriptReqs,
+    matchedLedgerKeys,
+    resolveLedgerCallDate,
+    mergedDesktop,
+    mergedCliLocal,
+    effectiveCliWsl,
+    savedCliWsl,
+    mergedLegacyUnallocated,
+    archiveV2,
+    compactModelConfigs,
+    wslEnabled
+  });
   const out = {
     schemaVersion: '0.8.5',
     version: '0.8.5',
@@ -4202,10 +4417,12 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
       cliLocal: mergedCliLocal,
       cliWsl: effectiveCliWsl,
       legacyUnallocated: mergedLegacyUnallocated
-    }
+    },
+    dailyModelMapBySource: modelBreakdown.dailyModelMapBySource,
+    modelMetaByKey: modelBreakdown.modelMetaByKey
   };
 
-  const archiveSig = `${agDir}|${earliestDate}|${totalConversations}|${grandTotalTokens}|${totalSteps}|${wslEnabled ? '1' : '0'}|${wslCliTranscriptsCount}|${effectivePlanStatus?.tierKey || ''}|${effectivePlanStatus?.actualPricePaid ?? ''}|${effectivePlanStatus?.currency || ''}|${costEstimate?.pricedCostUSD ?? ''}`;
+  const archiveSig = `${agDir}|${earliestDate}|${totalConversations}|${grandTotalTokens}|${totalSteps}|${wslEnabled ? '1' : '0'}|${wslCliTranscriptsCount}|m:${Object.keys(modelBreakdown.modelMetaByKey).length}|${effectivePlanStatus?.tierKey || ''}|${effectivePlanStatus?.actualPricePaid ?? ''}|${effectivePlanStatus?.currency || ''}|${costEstimate?.pricedCostUSD ?? ''}`;
   const isStaleCheck = typeof extraContext.isStale === 'function' ? extraContext.isStale : null;
   if (isStaleCheck && isStaleCheck()) {
     return { out, archiveSig: null, accountKey: currentAccountKey || null, stale: true };
@@ -4230,7 +4447,9 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
         dailyMapBySource: {
           ...out.dailyMapBySource,
           cliWsl: savedCliWsl
-        }
+        },
+        dailyModelMapBySource: modelBreakdown.savedDailyModelBySource,
+        modelMetaByKey: modelBreakdown.modelMetaByKey
       };
       safeWriteJsonSync(archivePathV2, v2Payload);
 
