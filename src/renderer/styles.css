@@ -673,16 +673,19 @@
     }
     .model-usage-stack{
       width:100%;max-width:44px;display:flex;flex-direction:column;overflow:hidden;
-      border-radius:4px 4px 0 0;transition:filter .14s,transform .14s;
+      border-radius:3px 3px 0 0;transition:filter .14s,transform .14s;
     }
     .model-usage-bars.compact-30 .model-usage-stack{
       max-width:18px;border-radius:3px 3px 0 0;
     }
     .model-usage-col:hover .model-usage-stack{
-      filter:brightness(1.12);
+      filter:brightness(1.1);
     }
     .model-usage-seg{
-      width:100%;min-height:2px;transition:height .2s cubic-bezier(0.16,1,0.3,1);
+      width:100%;min-height:2px;opacity:0.9;transition:height .2s cubic-bezier(0.16,1,0.3,1),opacity .14s;
+    }
+    .model-usage-col:hover .model-usage-seg{
+      opacity:1;
     }
     .model-usage-empty-bar{
       width:100%;max-width:44px;height:2px;border-radius:2px 2px 0 0;background:rgba(148,163,184,0.16);

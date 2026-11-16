@@ -2784,6 +2784,195 @@ function sumDailyMapTokens(mapObj) {
   return total;
 }
 
+const TRANSCRIPT_SCAN_CACHE_VERSION = 2;
+let cachedNodeDatabaseSync;
+
+function getNodeDatabaseSync() {
+  if (cachedNodeDatabaseSync !== undefined) return cachedNodeDatabaseSync;
+  try {
+    cachedNodeDatabaseSync = require('node:sqlite').DatabaseSync || null;
+  } catch {
+    cachedNodeDatabaseSync = null;
+  }
+  return cachedNodeDatabaseSync;
+}
+
+/**
+ * 构建 SQLite 只读 immutable URI，兼容 Windows 盘符、WSL UNC (\\wsl.localhost\...) 与 POSIX 路径。
+ * 必须显式使用 file:////wsl.localhost/...?immutable=1，否则 9P 共享目录会报 database is locked。
+ * @param {string} dbPath
+ * @returns {string}
+ */
+function buildSqliteImmutableUri(dbPath) {
+  const normalized = String(dbPath || '').replace(/\\/g, '/');
+  const encoded = encodeURI(normalized).replace(/#/g, '%23').replace(/\?/g, '%3F');
+  if (encoded.startsWith('//')) {
+    return `file://${encoded}?immutable=1`;
+  }
+  return `file:///${encoded.replace(/^\/+/, '')}?immutable=1`;
+}
+
+function readPbVarint(buf, offset, end = buf.length) {
+  let value = 0;
+  let multiplier = 1;
+  let pos = offset;
+  while (pos < end && pos - offset < 10) {
+    const byte = buf[pos++];
+    value += (byte & 0x7f) * multiplier;
+    if ((byte & 0x80) === 0) {
+      return { value, next: pos };
+    }
+    multiplier *= 128;
+  }
+  return null;
+}
+
+function walkPbFields(buf, start, end, onField) {
+  let pos = start;
+  while (pos < end) {
+    const tagInfo = readPbVarint(buf, pos, end);
+    if (!tagInfo) break;
+    pos = tagInfo.next;
+    const fieldNum = Math.floor(tagInfo.value / 8);
+    const wireType = tagInfo.value % 8;
+    if (fieldNum <= 0) break;
+
+    if (wireType === 0) {
+      const valInfo = readPbVarint(buf, pos, end);
+      if (!valInfo) break;
+      pos = valInfo.next;
+      onField(fieldNum, wireType, valInfo.value, 0, 0);
+    } else if (wireType === 1) {
+      if (pos + 8 > end) break;
+      pos += 8;
+      onField(fieldNum, wireType, 0, pos - 8, pos);
+    } else if (wireType === 2) {
+      const lenInfo = readPbVarint(buf, pos, end);
+      if (!lenInfo || lenInfo.value < 0) break;
+      const valStart = lenInfo.next;
+      const valEnd = valStart + lenInfo.value;
+      if (valEnd > end) break;
+      pos = valEnd;
+      onField(fieldNum, wireType, 0, valStart, valEnd);
+    } else if (wireType === 5) {
+      if (pos + 4 > end) break;
+      pos += 4;
+      onField(fieldNum, wireType, 0, pos - 4, pos);
+    } else {
+      break;
+    }
+  }
+}
+
+/**
+ * 从会话数据库 gen_metadata.data 的 Protobuf 负载提取 stepIndex -> model/label 映射。
+ * 顶层字段 2 为 stepIndices（单个 varint 或 packed varint），字段 1 内的 19 为 rawModel、21 为展示标签。
+ * @param {Buffer|Uint8Array} rawData
+ * @returns {Array<{stepIndex: number, model: string}>}
+ */
+function extractStepModelsFromGenMetadataBlob(rawData) {
+  if (!rawData || !rawData.length) return [];
+  const buf = Buffer.isBuffer(rawData) ? rawData : Buffer.from(rawData);
+  const steps = [];
+  let rawModel = '';
+  let label = '';
+
+  walkPbFields(buf, 0, buf.length, (fn, wt, val, vs, ve) => {
+    if (fn === 2) {
+      if (wt === 0 && Number.isInteger(val) && val >= 0) {
+        steps.push(val);
+      } else if (wt === 2) {
+        let p = vs;
+        while (p < ve) {
+          const item = readPbVarint(buf, p, ve);
+          if (!item) break;
+          if (Number.isInteger(item.value) && item.value >= 0) {
+            steps.push(item.value);
+          }
+          p = item.next;
+        }
+      }
+    } else if (fn === 1 && wt === 2) {
+      walkPbFields(buf, vs, ve, (cfn, cwt, _cval, cvs, cve) => {
+        if (cwt !== 2) return;
+        if (cfn === 19) {
+          const str = buf.toString('utf8', cvs, cve).trim();
+          if (str) rawModel = str;
+        } else if (cfn === 21) {
+          const str = buf.toString('utf8', cvs, cve).trim();
+          if (str) label = str;
+        }
+      });
+    }
+  });
+
+  const resolved = label || rawModel;
+  if (!resolved || !steps.length) return [];
+  return steps.map(stepIndex => ({ stepIndex, model: resolved }));
+}
+
+function loadStepModelMapFromSqlite(dbPath) {
+  const stepToModel = new Map();
+  if (!dbPath || !origFsMethods.existsSync(dbPath)) return stepToModel;
+  const DatabaseSync = getNodeDatabaseSync();
+  if (!DatabaseSync) return stepToModel;
+  let db = null;
+  try {
+    db = new DatabaseSync(buildSqliteImmutableUri(dbPath), { readOnly: true });
+    const rows = db.prepare('SELECT data FROM gen_metadata').all();
+    for (const row of rows) {
+      const entries = extractStepModelsFromGenMetadataBlob(row?.data);
+      for (const item of entries) {
+        if (item && Number.isInteger(item.stepIndex) && item.model) {
+          stepToModel.set(item.stepIndex, item.model);
+        }
+      }
+    }
+  } catch {
+    // 忽略损坏文件、未就绪表或非预期 schema
+  } finally {
+    if (db) {
+      try { db.close(); } catch { }
+    }
+  }
+  return stepToModel;
+}
+
+function backfillMissingModelsFromConversationDb(parsed, job, options = {}) {
+  if (!parsed || !Array.isArray(parsed.records) || !parsed.records.length) return 0;
+  if (!job?.convDir || options.fs || isFsMonkeyPatched()) return 0;
+
+  const missingByCascade = new Map();
+  for (const rec of parsed.records) {
+    if (!rec || rec.model || rec.tot <= 0) continue;
+    if (!Number.isInteger(rec.stepIndex) || rec.stepIndex < 0) continue;
+    const cid = String(rec.cascadeId || '').trim();
+    if (!cid || cid.includes('..') || cid.includes('/') || cid.includes('\\')) continue;
+    let list = missingByCascade.get(cid);
+    if (!list) {
+      list = [];
+      missingByCascade.set(cid, list);
+    }
+    list.push(rec);
+  }
+  if (missingByCascade.size === 0) return 0;
+
+  let filledCount = 0;
+  for (const [cid, recs] of missingByCascade.entries()) {
+    const dbPath = path.join(job.convDir, `${cid}.db`);
+    const stepModelMap = loadStepModelMapFromSqlite(dbPath);
+    if (stepModelMap.size === 0) continue;
+    for (const rec of recs) {
+      const recovered = stepModelMap.get(rec.stepIndex);
+      if (recovered) {
+        rec.model = recovered;
+        filledCount++;
+      }
+    }
+  }
+  return filledCount;
+}
+
 function parseTranscriptFileContent(content, jobPath) {
   const records = [];
   let minCreatedAt = null;
@@ -3437,15 +3626,23 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
     } catch { }
   };
 
-  walkTranscripts(brainDir, 'desktop', 0, { subSource: 'desktop' });
+  walkTranscripts(brainDir, 'desktop', 0, { subSource: 'desktop', convDir });
   if (fs.existsSync(path.join(agCliDir, 'brain'))) {
-    walkTranscripts(path.join(agCliDir, 'brain'), 'cli', 0, { subSource: 'cli_local' });
+    walkTranscripts(path.join(agCliDir, 'brain'), 'cli', 0, {
+      subSource: 'cli_local',
+      convDir: path.join(agCliDir, 'conversations')
+    });
   }
   for (const wslDir of wslDiscovery.dirs) {
     const wslBrain = path.join(wslDir.path, 'brain');
     if (fs.existsSync(wslBrain)) {
       const beforeCount = transcriptJobs.length;
-      walkTranscripts(wslBrain, 'cli', 0, { subSource: 'cli_wsl', wslPath: wslDir.path, distro: wslDir.distro });
+      walkTranscripts(wslBrain, 'cli', 0, {
+        subSource: 'cli_wsl',
+        wslPath: wslDir.path,
+        distro: wslDir.distro,
+        convDir: path.join(wslDir.path, 'conversations')
+      });
       const statEntry = wslStatsByPath.get(wslDir.path);
       if (statEntry) {
         statEntry.transcriptsCount = transcriptJobs.length - beforeCount;
@@ -3462,7 +3659,7 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
   if (useDiskCache && transcriptFileCache.size === 0) {
     try {
       const diskCacheRead = safeReadJsonSync(transcriptCachePath, null);
-      if (diskCacheRead.exists && diskCacheRead.ok && diskCacheRead.data?.version === 1 && diskCacheRead.data.files && typeof diskCacheRead.data.files === 'object') {
+      if (diskCacheRead.exists && diskCacheRead.ok && diskCacheRead.data?.version === TRANSCRIPT_SCAN_CACHE_VERSION && diskCacheRead.data.files && typeof diskCacheRead.data.files === 'object') {
         for (const [fPath, entry] of Object.entries(diskCacheRead.data.files)) {
           if (!entry || typeof entry !== 'object' || !Array.isArray(entry.records)) continue;
           transcriptFileCache.set(fPath, {
@@ -3495,6 +3692,7 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
           }
           const content = await fs.promises.readFile(job.path, 'utf8');
           const parsed = parseTranscriptFileContent(content, job.path);
+          backfillMissingModelsFromConversationDb(parsed, job, options);
           parsedJobEntries[idx] = { ...parsed, size: st.size, mtimeMs: st.mtimeMs, dirty: true };
         } catch { }
       }
@@ -3529,6 +3727,7 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
         } else {
           const content = fs.readFileSync(job.path, 'utf8');
           const parsed = parseTranscriptFileContent(content, job.path);
+          backfillMissingModelsFromConversationDb(parsed, job, options);
           diskCacheDirty = true;
           if (transcriptFileCache.size > MAX_TRANSCRIPT_MEMORY_CACHE) {
             const oldestKey = transcriptFileCache.keys().next().value;
@@ -4422,7 +4621,11 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
     modelMetaByKey: modelBreakdown.modelMetaByKey
   };
 
-  const archiveSig = `${agDir}|${earliestDate}|${totalConversations}|${grandTotalTokens}|${totalSteps}|${wslEnabled ? '1' : '0'}|${wslCliTranscriptsCount}|m:${Object.keys(modelBreakdown.modelMetaByKey).length}|${effectivePlanStatus?.tierKey || ''}|${effectivePlanStatus?.actualPricePaid ?? ''}|${effectivePlanStatus?.currency || ''}|${costEstimate?.pricedCostUSD ?? ''}`;
+  const unattributedModelTokens = Object.values(modelBreakdown.dailyModelMapBySource?.all || {}).reduce(
+    (acc, dayRec) => acc + (Number(dayRec?.[UNATTRIBUTED_MODEL_KEY]?.total) || 0),
+    0
+  );
+  const archiveSig = `${agDir}|${earliestDate}|${totalConversations}|${grandTotalTokens}|${totalSteps}|${wslEnabled ? '1' : '0'}|${wslCliTranscriptsCount}|m:${Object.keys(modelBreakdown.modelMetaByKey).length}|u:${unattributedModelTokens}|${effectivePlanStatus?.tierKey || ''}|${effectivePlanStatus?.actualPricePaid ?? ''}|${effectivePlanStatus?.currency || ''}|${costEstimate?.pricedCostUSD ?? ''}`;
   const isStaleCheck = typeof extraContext.isStale === 'function' ? extraContext.isStale : null;
   if (isStaleCheck && isStaleCheck()) {
     return { out, archiveSig: null, accountKey: currentAccountKey || null, stale: true };
@@ -4488,7 +4691,7 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
           };
         }
       }
-      safeWriteJsonSync(transcriptCachePath, { version: 1, files: cacheFiles }, { indent: 0 });
+      safeWriteJsonSync(transcriptCachePath, { version: TRANSCRIPT_SCAN_CACHE_VERSION, files: cacheFiles }, { indent: 0 });
     } catch { }
   }
 
@@ -5953,6 +6156,10 @@ module.exports = {
   inferWslMetaFromPath,
   mergeDailyMaps,
   sumDailyMapTokens,
+  buildSqliteImmutableUri,
+  extractStepModelsFromGenMetadataBlob,
+  loadStepModelMapFromSqlite,
+  backfillMissingModelsFromConversationDb,
   resetWslDiscoveryCacheForTest,
   scanFiles,
   pythonScan,

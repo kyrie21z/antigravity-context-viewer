@@ -4867,6 +4867,27 @@ test('By Model usage view: renders stacked bars, percentages, 7d/30d, variant/ca
     h.elements.get('src-tab-desktop').click();
     assert.equal(h.elements.get('model-usage-window-total').textContent, '100.0K Tokens');
     assert.equal(legendEl.children.length, 1);
+
+    // Switch back to all sources and verify variant effort shade + dark/light theme color adaptation
+    h.elements.get('src-tab-all').click();
+    h.sandbox.__AGContextMeter.setTheme('dark');
+    assert.equal(legendEl.children[0].children[0].style.background, '#826cc3'); // gemini-4-hydrogen:xhigh shade
+
+    h.elements.get('model-group-model').click();
+    h.elements.get('model-metric-total').click();
+    h.elements.get('model-toggle-unattr').click(); // show unattributed again
+    assert.equal(legendEl.children.length, 3);
+    assert.equal(legendEl.children[0].children[0].style.background, '#a78bfa');
+    assert.equal(legendEl.children[1].children[0].style.background, '#6366f1');
+    assert.equal(legendEl.children[2].children[0].style.background, 'rgba(161, 161, 170, 0.28)');
+
+    h.sandbox.__AGContextMeter.setTheme('light');
+    assert.equal(legendEl.children[0].children[0].style.background, '#7c3aed');
+    assert.equal(legendEl.children[1].children[0].style.background, '#4f46e5');
+    assert.equal(legendEl.children[2].children[0].style.background, 'rgba(113, 113, 122, 0.24)');
+
+    h.sandbox.__AGContextMeter.setTheme('dark');
+    assert.equal(legendEl.children[0].children[0].style.background, '#a78bfa');
   } finally {
     api.dispose();
   }

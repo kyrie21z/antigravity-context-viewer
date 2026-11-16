@@ -1754,12 +1754,18 @@
     const bySrcModel = ANTIGRAVITY_TOKEN_DATA.dailyModelMapBySource || {};
     const dailyModelMap = bySrcModel[activeTokenSource] || bySrcModel.all || ANTIGRAVITY_TOKEN_DATA.dailyModelMap || {};
 
+    const isLightTone = host.getAttribute?.('data-theme') === 'light' || host.getAttribute?.('data-panel-tone') === 'light';
+    const themeAccent = customColors?.tokenAccent || (typeof heatPreset !== 'undefined' && heatPreset !== 'purple' && typeof getEffectiveHeatmapScale === 'function'
+      ? getEffectiveHeatmapScale()[3]
+      : '');
     const summary = core.summarizeModelUsageWindow(dailyModelMap, {
       periodDays: modelUsagePeriodDays,
       endDate,
       groupBy: modelUsageGroupBy,
       metric: modelUsageMetric,
       hideUnattributed: modelUsageHideUnattr,
+      theme: isLightTone ? 'light' : 'dark',
+      accentColor: themeAccent || undefined,
       modelMetaByKey: ANTIGRAVITY_TOKEN_DATA.modelMetaByKey,
       unattributedLabel: t('modelsUsage.unattributed')
     });

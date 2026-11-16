@@ -3809,20 +3809,34 @@
     'claude-sonnet-5-5': 'Claude Sonnet 5.5',
     'gpt-oss-120b': 'GPT-OSS 120B'
   };
-  const MODEL_FIXED_COLORS = {
-    'gemini-4-hydrogen': '#3b9eff',
-    'gemini-4-argon': '#f59e0b',
-    'gemini-3.8-flash': '#34d399',
-    'gemini-4-carbon': '#f472b6',
-    'claude-opus-5-5': '#a78bfa',
-    'claude-sonnet-5-5': '#c084fc',
-    'gpt-oss-120b': '#22d3ee',
-    'gemini-3.1-pro-preview': '#60a5fa',
+  const MODEL_FIXED_COLORS_DARK = {
+    'gemini-4-hydrogen': '#a78bfa',
+    'gemini-4-argon': '#6366f1',
+    'gemini-3.8-flash': '#38bdf8',
+    'gemini-4-carbon': '#e879f9',
+    'claude-opus-5-5': '#f59e0b',
+    'claude-sonnet-5-5': '#fbbf24',
+    'gpt-oss-120b': '#10b981',
+    'gemini-3.1-pro-preview': '#818cf8',
     'gemini-3.5-flash-lite': '#2dd4bf',
-    'gemini-2.5-pro': '#818cf8',
-    [UNATTRIBUTED_MODEL_KEY]: '#71717a'
+    'gemini-2.5-pro': '#8b5cf6',
+    [UNATTRIBUTED_MODEL_KEY]: 'rgba(161, 161, 170, 0.28)'
   };
-  const MODEL_FALLBACK_PALETTE = ['#3b9eff', '#f59e0b', '#34d399', '#f472b6', '#a78bfa', '#22d3ee', '#fb7185', '#facc15'];
+  const MODEL_FIXED_COLORS_LIGHT = {
+    'gemini-4-hydrogen': '#7c3aed',
+    'gemini-4-argon': '#4f46e5',
+    'gemini-3.8-flash': '#0284c7',
+    'gemini-4-carbon': '#c026d3',
+    'claude-opus-5-5': '#d97706',
+    'claude-sonnet-5-5': '#b45309',
+    'gpt-oss-120b': '#059669',
+    'gemini-3.1-pro-preview': '#4338ca',
+    'gemini-3.5-flash-lite': '#0d9488',
+    'gemini-2.5-pro': '#6d28d9',
+    [UNATTRIBUTED_MODEL_KEY]: 'rgba(113, 113, 122, 0.24)'
+  };
+  const MODEL_FALLBACK_PALETTE_DARK = ['#a78bfa', '#38bdf8', '#6366f1', '#2dd4bf', '#f59e0b', '#e879f9', '#10b981', '#818cf8'];
+  const MODEL_FALLBACK_PALETTE_LIGHT = ['#7c3aed', '#0284c7', '#4f46e5', '#0d9488', '#d97706', '#c026d3', '#059669', '#4338ca'];
 
   function resolveModelUsageBucket(call, cascadeModelConfigs = []) {
     if (!call || typeof call !== 'object') {
@@ -3883,16 +3897,66 @@
     return `${y}-${m}-${day}`;
   }
 
-  function getModelChartColor(key, rankIdx = 0) {
-    if (key === UNATTRIBUTED_MODEL_KEY) return MODEL_FIXED_COLORS[UNATTRIBUTED_MODEL_KEY];
-    const baseKey = String(key || '').split(':')[0];
-    if (MODEL_FIXED_COLORS[key]) return MODEL_FIXED_COLORS[key];
-    if (MODEL_FIXED_COLORS[baseKey] && key === baseKey) return MODEL_FIXED_COLORS[baseKey];
-    let hash = 0;
-    for (let i = 0; i < String(key).length; i++) {
-      hash = (hash * 31 + String(key).charCodeAt(i)) >>> 0;
+  function parseHexRgb(hexStr) {
+    const clean = String(hexStr || '').trim().replace(/^#/, '');
+    if (!/^[0-9a-fA-F]{6}$/.test(clean)) return null;
+    const n = parseInt(clean, 16);
+    return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+  }
+
+  function shiftHexShade(hexStr, amount) {
+    const rgb = parseHexRgb(hexStr);
+    if (!rgb) return hexStr;
+    const amt = Math.max(-0.6, Math.min(0.6, Number(amount) || 0));
+    const mix = (ch) => amt >= 0
+      ? Math.round(ch + (255 - ch) * amt)
+      : Math.round(ch * (1 + amt));
+    const to2 = v => Math.max(0, Math.min(255, v)).toString(16).padStart(2, '0');
+    return `#${to2(mix(rgb.r))}${to2(mix(rgb.g))}${to2(mix(rgb.b))}`;
+  }
+
+  function resolveBaseModelColor(baseKey, rankIdx = 0, options = {}) {
+    const isLight = options.theme === 'light';
+    const fixedTable = isLight ? MODEL_FIXED_COLORS_LIGHT : MODEL_FIXED_COLORS_DARK;
+    const palette = isLight ? MODEL_FALLBACK_PALETTE_LIGHT : MODEL_FALLBACK_PALETTE_DARK;
+    const accentHex = parseHexRgb(options.accentColor) ? String(options.accentColor).trim() : null;
+
+    if (baseKey === 'gemini-4-hydrogen' && accentHex) {
+      return accentHex;
     }
-    return MODEL_FALLBACK_PALETTE[(rankIdx + hash) % MODEL_FALLBACK_PALETTE.length];
+    if (fixedTable[baseKey]) return fixedTable[baseKey];
+    if (baseKey.startsWith('claude-')) {
+      return baseKey.includes('sonnet') ? fixedTable['claude-sonnet-5-5'] : fixedTable['claude-opus-5-5'];
+    }
+    if (baseKey.includes('gpt')) return fixedTable['gpt-oss-120b'];
+    if (baseKey.includes('flash')) return fixedTable['gemini-3.8-flash'];
+    if (baseKey.includes('argon')) return fixedTable['gemini-4-argon'];
+    if (baseKey.includes('carbon')) return fixedTable['gemini-4-carbon'];
+    if (baseKey.includes('hydrogen')) return accentHex || fixedTable['gemini-4-hydrogen'];
+    let hash = 0;
+    for (let i = 0; i < baseKey.length; i++) {
+      hash = (hash * 31 + baseKey.charCodeAt(i)) >>> 0;
+    }
+    return palette[(rankIdx + hash) % palette.length];
+  }
+
+  function getModelChartColor(key, rankIdx = 0, options = {}) {
+    const isLight = options.theme === 'light';
+    const fixedTable = isLight ? MODEL_FIXED_COLORS_LIGHT : MODEL_FIXED_COLORS_DARK;
+    if (key === UNATTRIBUTED_MODEL_KEY) return fixedTable[UNATTRIBUTED_MODEL_KEY];
+
+    const parts = String(key || '').split(':');
+    const baseKey = parts[0] || String(key || '');
+    const effortPart = (parts[1] || '').toLowerCase();
+    const baseColor = resolveBaseModelColor(baseKey, rankIdx, options);
+
+    if (!effortPart) return baseColor;
+    // 同模型家族内按档位做同色系明度阶梯区分
+    const shadeOffsetByEffort = isLight
+      ? { xhigh: -0.24, extrahigh: -0.24, max: -0.24, high: -0.05, medium: 0.16, low: 0.34, minimal: 0.42 }
+      : { xhigh: -0.22, extrahigh: -0.22, max: -0.22, high: -0.04, medium: 0.18, low: 0.34, minimal: 0.42 };
+    const offset = shadeOffsetByEffort[effortPart];
+    return offset !== undefined ? shiftHexShade(baseColor, offset) : baseColor;
   }
 
   /**
@@ -3990,12 +4054,21 @@
     const colorByKey = new Map();
     const orderByKey = new Map();
     const usedColors = new Set();
+    const themeOpt = options.theme === 'light' ? 'light' : 'dark';
+    const fallbackPalette = themeOpt === 'light' ? MODEL_FALLBACK_PALETTE_LIGHT : MODEL_FALLBACK_PALETTE_DARK;
+    const colorOpts = { theme: themeOpt, accentColor: options.accentColor || null };
     sortedWin.forEach((item, idx) => {
       orderByKey.set(item.key, idx);
-      let color = getModelChartColor(item.key, idx);
+      let color = getModelChartColor(item.key, idx, colorOpts);
       if (item.key !== UNATTRIBUTED_MODEL_KEY && usedColors.has(color)) {
-        const alt = MODEL_FALLBACK_PALETTE.find(c => !usedColors.has(c));
-        if (alt) color = alt;
+        const isVariant = item.key.includes(':');
+        if (isVariant) {
+          color = shiftHexShade(color, themeOpt === 'light' ? 0.12 : -0.12);
+        }
+        if (usedColors.has(color)) {
+          const alt = fallbackPalette.find(c => !usedColors.has(c));
+          if (alt) color = alt;
+        }
       }
       usedColors.add(color);
       colorByKey.set(item.key, color);
@@ -4090,6 +4163,7 @@
     resolveStableModelId,
     UNATTRIBUTED_MODEL_KEY,
     resolveModelUsageBucket,
+    getModelChartColor,
     summarizeModelUsageWindow,
     EFFORT_WHITELIST,
     formatEffortLabel,

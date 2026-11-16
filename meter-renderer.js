@@ -761,16 +761,19 @@
     }
     .model-usage-stack{
       width:100%;max-width:44px;display:flex;flex-direction:column;overflow:hidden;
-      border-radius:4px 4px 0 0;transition:filter .14s,transform .14s;
+      border-radius:3px 3px 0 0;transition:filter .14s,transform .14s;
     }
     .model-usage-bars.compact-30 .model-usage-stack{
       max-width:18px;border-radius:3px 3px 0 0;
     }
     .model-usage-col:hover .model-usage-stack{
-      filter:brightness(1.12);
+      filter:brightness(1.1);
     }
     .model-usage-seg{
-      width:100%;min-height:2px;transition:height .2s cubic-bezier(0.16,1,0.3,1);
+      width:100%;min-height:2px;opacity:0.9;transition:height .2s cubic-bezier(0.16,1,0.3,1),opacity .14s;
+    }
+    .model-usage-col:hover .model-usage-seg{
+      opacity:1;
     }
     .model-usage-empty-bar{
       width:100%;max-width:44px;height:2px;border-radius:2px 2px 0 0;background:rgba(148,163,184,0.16);
@@ -8252,6 +8255,15 @@ function formatVendorLabel(vendor) {
     }
   }
 
+  function refreshActiveChartViews() {
+    if (activeHeatView === 'weekly') renderHeatmapWeekly();
+    else if (activeHeatView === 'cum') renderHeatmapCum();
+    const modelViewEl = el('model-usage-view');
+    if (modelViewEl && modelViewEl.style && modelViewEl.style.display === 'block' && typeof renderModelUsageView === 'function') {
+      renderModelUsageView();
+    }
+  }
+
   function applyCustomColors() {
     for (const [key, cssVar] of Object.entries(COLOR_SLOTS)) {
       const val = customColors[key];
@@ -8273,8 +8285,7 @@ function formatVendorLabel(vendor) {
     }
     applyHeatmapPalette();
     syncSwatchAndResetButtons();
-    if (activeHeatView === 'weekly') renderHeatmapWeekly();
-    else if (activeHeatView === 'cum') renderHeatmapCum();
+    refreshActiveChartViews();
   }
 
   function setCustomColor(key, value) {
@@ -8337,8 +8348,7 @@ function formatVendorLabel(vendor) {
     });
     applyHeatmapPalette();
     syncSwatchAndResetButtons();
-    if (activeHeatView === 'weekly') renderHeatmapWeekly();
-    else if (activeHeatView === 'cum') renderHeatmapCum();
+    refreshActiveChartViews();
     syncNativeOverlayTheme();
   }
 
@@ -11756,12 +11766,18 @@ function closeAllDropdowns(exceptWrap = null) {
     const bySrcModel = ANTIGRAVITY_TOKEN_DATA.dailyModelMapBySource || {};
     const dailyModelMap = bySrcModel[activeTokenSource] || bySrcModel.all || ANTIGRAVITY_TOKEN_DATA.dailyModelMap || {};
 
+    const isLightTone = host.getAttribute?.('data-theme') === 'light' || host.getAttribute?.('data-panel-tone') === 'light';
+    const themeAccent = customColors?.tokenAccent || (typeof heatPreset !== 'undefined' && heatPreset !== 'purple' && typeof getEffectiveHeatmapScale === 'function'
+      ? getEffectiveHeatmapScale()[3]
+      : '');
     const summary = core.summarizeModelUsageWindow(dailyModelMap, {
       periodDays: modelUsagePeriodDays,
       endDate,
       groupBy: modelUsageGroupBy,
       metric: modelUsageMetric,
       hideUnattributed: modelUsageHideUnattr,
+      theme: isLightTone ? 'light' : 'dark',
+      accentColor: themeAccent || undefined,
       modelMetaByKey: ANTIGRAVITY_TOKEN_DATA.modelMetaByKey,
       unattributedLabel: t('modelsUsage.unattributed')
     });
