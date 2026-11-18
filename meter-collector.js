@@ -2845,7 +2845,7 @@ function sumDailyMapTokens(mapObj) {
   return total;
 }
 
-const TRANSCRIPT_SCAN_CACHE_VERSION = 2;
+const TRANSCRIPT_SCAN_CACHE_VERSION = 3;
 let cachedNodeDatabaseSync;
 
 function getNodeDatabaseSync() {
@@ -2999,13 +2999,21 @@ function loadStepModelMapFromSqlite(dbPath) {
   return stepToModel;
 }
 
+function needsDbLabelEnrichment(rec) {
+  if (!rec || !(rec.tot > 0)) return false;
+  if (!rec.model) return true;
+  if (/^model_/i.test(rec.model)) return true;
+  if (!rec.modelLabel && !/[A-Z\s()]/.test(rec.model)) return true;
+  return false;
+}
+
 function backfillMissingModelsFromConversationDb(parsed, job, options = {}) {
   if (!parsed || !Array.isArray(parsed.records) || !parsed.records.length) return 0;
   if (!job?.convDir || options.fs || isFsMonkeyPatched()) return 0;
 
   const missingByCascade = new Map();
   for (const rec of parsed.records) {
-    if (!rec || rec.model || rec.tot <= 0) continue;
+    if (!needsDbLabelEnrichment(rec)) continue;
     if (!Number.isInteger(rec.stepIndex) || rec.stepIndex < 0) continue;
     const cid = String(rec.cascadeId || '').trim();
     if (!cid || cid.includes('..') || cid.includes('/') || cid.includes('\\')) continue;
@@ -3026,7 +3034,12 @@ function backfillMissingModelsFromConversationDb(parsed, job, options = {}) {
     for (const rec of recs) {
       const recovered = stepModelMap.get(rec.stepIndex);
       if (recovered) {
-        rec.model = recovered;
+        if (!rec.model || /^model_/i.test(rec.model)) {
+          rec.model = recovered;
+        }
+        if (/[A-Z\s()]/.test(recovered)) {
+          rec.modelLabel = recovered;
+        }
         filledCount++;
       }
     }
@@ -3367,17 +3380,21 @@ function buildDailyModelBreakdown(params) {
     mergedLegacyUnallocated,
     archiveV2,
     compactModelConfigs,
+    availableModelDetails,
     wslEnabled
   } = params;
 
-  const modelMetaByKey = { ...(archiveV2?.modelMetaByKey || {}) };
+  const modelMetaByKey = {};
+  const archivedMetaByKey = (archiveV2?.modelMetaByKey && typeof archiveV2.modelMetaByKey === 'object')
+    ? archiveV2.modelMetaByKey
+    : {};
   const matchedModels = { desktop: {}, cliLocal: {}, cliWsl: {} };
   const extraModels = { desktop: {}, cliLocal: {}, cliWsl: {} };
 
   const addModelBucket = (srcMap, dateKey, callObj, inp, cap, outp, tot, steps = 1) => {
     if (!dateKey || !/^\d{4}-\d{2}-\d{2}$/.test(dateKey)) return;
     if (tot <= 0 && steps <= 0) return;
-    const bucket = resolveModelUsageBucket(callObj, compactModelConfigs);
+    const bucket = resolveModelUsageBucket(callObj, compactModelConfigs, availableModelDetails);
     const vKey = bucket.variantKey || UNATTRIBUTED_MODEL_KEY;
     if (bucket.isAttributed && vKey !== UNATTRIBUTED_MODEL_KEY) {
       modelMetaByKey[vKey] = {
@@ -3476,7 +3493,34 @@ function buildDailyModelBreakdown(params) {
         }
       } else if (archivedModels[dateKey]) {
         for (const [mKey, rec] of Object.entries(archivedModels[dateKey])) {
-          dayOut[mKey] = { ...rec };
+          if (!rec || typeof rec !== 'object') continue;
+          let effKey = mKey;
+          if (mKey !== UNATTRIBUTED_MODEL_KEY) {
+            const oldMeta = archivedMetaByKey[mKey] || null;
+            const probeLabel = oldMeta?.variantLabel || oldMeta?.modelLabel || '';
+            const reBucket = resolveModelUsageBucket(
+              { model: mKey, ...(probeLabel ? { modelLabel: probeLabel } : {}) },
+              compactModelConfigs,
+              availableModelDetails
+            );
+            effKey = reBucket.variantKey || mKey;
+            if (reBucket.isAttributed && effKey !== UNATTRIBUTED_MODEL_KEY) {
+              modelMetaByKey[effKey] = {
+                modelKey: reBucket.modelKey,
+                modelLabel: reBucket.modelLabel,
+                variantKey: effKey,
+                variantLabel: reBucket.variantLabel
+              };
+            } else if (oldMeta && !modelMetaByKey[effKey]) {
+              modelMetaByKey[effKey] = oldMeta;
+            }
+          }
+          if (!dayOut[effKey]) dayOut[effKey] = { total: 0, input: 0, output: 0, cache: 0, steps: 0 };
+          dayOut[effKey].total += rec.total;
+          dayOut[effKey].input += rec.input;
+          dayOut[effKey].output += rec.output;
+          dayOut[effKey].cache += rec.cache;
+          dayOut[effKey].steps += rec.steps;
           sumTot += rec.total; sumInp += rec.input; sumOut += rec.output; sumCap += rec.cache; sumSteps += rec.steps;
         }
       }
@@ -3879,6 +3923,7 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
         cascadeId: rec.cascadeId,
         stepIndex: rec.stepIndex,
         model: rec.model,
+        ...(rec.modelLabel ? { modelLabel: rec.modelLabel } : {}),
         modelKey,
         inputTokens: rec.inp,
         cacheTokens: rec.cap,
@@ -4593,6 +4638,7 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
     mergedLegacyUnallocated,
     archiveV2,
     compactModelConfigs,
+    availableModelDetails: livePlanStatus?.availableModelDetails || null,
     wslEnabled
   });
   const out = {
@@ -4694,7 +4740,8 @@ async function collectTokenHistoryCoreAsync(options = {}, extraContext = {}) {
     (acc, dayRec) => acc + (Number(dayRec?.[UNATTRIBUTED_MODEL_KEY]?.total) || 0),
     0
   );
-  const archiveSig = `${agDir}|${earliestDate}|${totalConversations}|${grandTotalTokens}|${totalSteps}|${wslEnabled ? '1' : '0'}|${wslCliTranscriptsCount}|m:${Object.keys(modelBreakdown.modelMetaByKey).length}|u:${unattributedModelTokens}|${effectivePlanStatus?.tierKey || ''}|${effectivePlanStatus?.tierId || ''}|${effectivePlanStatus?.teamsTier || ''}|${effectivePlanStatus?.actualPricePaid ?? ''}|${effectivePlanStatus?.currency || ''}|${costEstimate?.pricedCostUSD ?? ''}`;
+  const modelMetaSig = Object.keys(modelBreakdown.modelMetaByKey).sort().join(',');
+  const archiveSig = `${agDir}|${earliestDate}|${totalConversations}|${grandTotalTokens}|${totalSteps}|${wslEnabled ? '1' : '0'}|${wslCliTranscriptsCount}|m:${modelMetaSig}|u:${unattributedModelTokens}|${effectivePlanStatus?.tierKey || ''}|${effectivePlanStatus?.tierId || ''}|${effectivePlanStatus?.teamsTier || ''}|${effectivePlanStatus?.actualPricePaid ?? ''}|${effectivePlanStatus?.currency || ''}|${costEstimate?.pricedCostUSD ?? ''}`;
   const isStaleCheck = typeof extraContext.isStale === 'function' ? extraContext.isStale : null;
   if (isStaleCheck && isStaleCheck()) {
     return { out, archiveSig: null, accountKey: currentAccountKey || null, stale: true };
